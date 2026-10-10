@@ -1531,6 +1531,34 @@ class TestAutoScreen:
                 "user2@example.com"
             )
 
+    async def test_candidates_show_full_cards(self, tmp_path, fake_engine):
+        """Each candidate renders like the switch screen: per-window bars,
+        pcts and reset countdowns — and a sentinel label in place of bars."""
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(80.0, 10.0)),
+                make_account(3, entry=make_entry(sentinel=USAGE_TOKEN_EXPIRED)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            card2 = plain[plain.index("user2@example.com"):plain.index(
+                "user3@example.com"
+            )]
+            assert "5h" in card2 and "7d" in card2
+            assert "━" in card2 and "80%" in card2
+            assert "resets" in card2
+            card3 = plain[plain.index("user3@example.com"):]
+            assert tui_data.sentinel_label(USAGE_TOKEN_EXPIRED) in card3
+            assert "━" not in card3
+
 
 class TestEventText:
     def test_switch_event_styling_and_content(self):

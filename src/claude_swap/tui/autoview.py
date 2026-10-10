@@ -8,19 +8,21 @@ lock) make it safe to run alongside an external ``cswap auto``.
 
 The active account's full card sits on top (same widget as the dashboard's
 panel, with the threshold tick); this screen adds the engine badge, the
-ranked switch candidates, and the decision log. While it is up, the app's
+ranked switch candidates (full cards, same renderer as the switch screen),
+and the decision log. While it is up, the app's
 snapshot poller runs store-only: the engine is the only fetcher.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
@@ -35,7 +37,7 @@ from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
-from claude_swap.tui.widgets import AccountsPanel
+from claude_swap.tui.widgets import AccountsPanel, account_card_text
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -60,6 +62,23 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
     text.append(f"{data.clock_stamp()}  ", style=palette.muted)
     text.append(event.human(), style=style)
     return text
+
+
+class CandidatesPanel(Static):
+    """The ranked "Next best" cards. Renders at its current width (like
+    :class:`AccountsPanel`) so the bars and reset clocks re-flow on resize."""
+
+    def on_mount(self) -> None:
+        self.watch(self.app, "snapshot", lambda _snap: self.refresh(layout=True))
+        self.watch(self.app, "theme", lambda _t: self.refresh(layout=True))
+
+    def render(self) -> Text:
+        snap = self.app.snapshot
+        if snap is None or not isinstance(self.screen, AutoScreen):
+            return Text("")
+        return self.screen._candidates_text(
+            snap, active_number=snap.active_number, width=self.size.width or 80
+        )
 
 
 class AutoScreen(Screen):
@@ -93,7 +112,10 @@ class AutoScreen(Screen):
             with Horizontal(id="auto-title-row"):
                 yield Static(" DRY-RUN ", id="mode-badge", classes="dry")
                 yield Static("", id="auto-summary")
-            yield Static("", id="candidates")
+        # A screen child, not inside #auto-top: an auto-height parent sizes to
+        # the panel's full content and ignores this scroll's max-height cap.
+        with VerticalScroll(id="candidates-scroll"):
+            yield CandidatesPanel(id="candidates")
         yield RichLog(id="event-log", highlight=False, markup=False, wrap=True)
         yield Footer()
 
@@ -109,7 +131,6 @@ class AutoScreen(Screen):
         self._configured_threshold = self._settings.threshold
         self.app.threshold_pct = self._settings.threshold
         self._update_summary()
-        self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
         self._start_engine(dry_run=True)
 
@@ -126,9 +147,6 @@ class AutoScreen(Screen):
     def _on_theme_change(self, _theme: str) -> None:
         self._update_summary()
         self._update_badge()
-        snap = self.app.snapshot
-        if snap is not None:
-            self._on_snapshot(snap)
 
     def action_back(self) -> None:
         if self._adjusting:
@@ -187,6 +205,7 @@ class AutoScreen(Screen):
             self._engine.apply_threshold(value)
         self.app.threshold_pct = value
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
+        self.query_one("#candidates", CandidatesPanel).refresh()
         self._update_summary()
 
     def _update_summary(self) -> None:
@@ -284,42 +303,32 @@ class AutoScreen(Screen):
 
     # -- candidates -----------------------------------------------------------
 
-    def _on_snapshot(self, snap: AccountsSnapshot | None) -> None:
-        if snap is None:
-            return
-        self.query_one("#candidates", Static).update(
-            self._candidates_text(snap, active_number=snap.active_number)
-        )
-
     def _candidates_text(
-        self, snap: AccountsSnapshot, active_number: str | None
+        self, snap: AccountsSnapshot, active_number: str | None, width: int = 80
     ) -> Text:
-        """Switch targets ranked by remaining headroom (best first)."""
+        """Switch targets ranked by remaining headroom (best first), each as a
+        full account card — bars, pcts, and reset times, like the switch
+        screen."""
         # Same window set as the engine (autoswitch.model included), so the
         # displayed ranking can never disagree with the account it picks.
         palette = Palette.from_theme(self.app.current_theme)
         models = parse_model_names(self._settings.model) if self._settings else ()
+        now = time.time()
         ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
-        lines: dict[str, Text] = {}
+        cards: dict[str, Text] = {}
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
                 continue
-            pct = binding_pct(acc.usage.last_good, models)
-            entry = Text()
-            entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(acc.email, style=palette.foreground)
             if acc.usage.sentinel is not None:
-                entry.append(
-                    f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
-                )
-                ranked.append((998.0, acc.number))
-            elif pct is None:
-                entry.append("  usage unknown", style=palette.muted)
-                ranked.append((999.0, acc.number))
+                key = 998.0
             else:
-                entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
-                ranked.append((pct, acc.number))
-            lines[acc.number] = entry
+                pct = binding_pct(acc.usage.last_good, models)
+                key = 999.0 if pct is None else pct
+            ranked.append((key, acc.number))
+            cards[acc.number] = account_card_text(
+                acc, width, threshold=self.app.threshold_pct, now=now,
+                palette=palette,
+            )
 
         text = Text()
         text.append("Next best", style=palette.muted)
@@ -327,5 +336,6 @@ class AutoScreen(Screen):
             text.append("\n  no other switchable accounts", style=palette.muted)
             return text
         for _pct, number in sorted(ranked):
-            text.append(lines[number])
+            text.append("\n\n")
+            text.append(cards[number])
         return text

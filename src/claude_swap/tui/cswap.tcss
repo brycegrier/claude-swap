@@ -81,7 +81,7 @@ MenuItem Static.menu-item-muted { color: $secondary; }
 #auto-top {
     height: auto;
     background: $background;
-    padding: 1 2;
+    padding: 1 2 0 2;
 }
 
 #auto-title-row {
@@ -108,6 +108,14 @@ MenuItem Static.menu-item-muted { color: $secondary; }
     width: 1fr;
     color: $secondary;
     padding-left: 2;
+}
+
+#candidates-scroll {
+    height: auto;
+    max-height: 50vh;
+    background: $background;
+    padding: 0 2 1 2;
+    scrollbar-size-vertical: 1;
 }
 
 #candidates {
