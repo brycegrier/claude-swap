@@ -11,6 +11,9 @@ account-targeted opens a context of its own:
   (cursor appears on the active account), Enter switches and *stays
   watching*, Esc disarms.
 - "Remove account" nests into a submenu listing the accounts.
+- "Settings" lists the ``autoswitch`` keys of settings.json (the same ones
+  ``cswap config`` edits): choices open a submenu, booleans toggle in place,
+  numbers and text open an input modal.
 
 No global command palette: actions live where their context is.
 """
@@ -25,7 +28,17 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import Footer, ListView, Static
 
+from claude_swap.exceptions import ConfigError
 from claude_swap.models import AccountsSnapshot
+from claude_swap.settings import (
+    SETTING_SPECS,
+    effective_settings,
+    format_setting_value,
+    load_settings,
+    set_setting,
+    unset_setting,
+)
+from claude_swap.tui.modals import RESET_TO_DEFAULT, SettingInputModal
 from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
 
 if TYPE_CHECKING:
@@ -80,6 +93,7 @@ class DashboardScreen(Screen):
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
             ("Remove account…", "remove-menu"),
+            ("Settings…", "settings-menu"),
             ("Theme…", "theme-menu"),
             ("Quit", "quit"),
         ]
@@ -129,6 +143,51 @@ class DashboardScreen(Screen):
         entries.append(_BACK)
         return entries
 
+    def _setting_rows(self) -> list:
+        """(spec, value, is_set) for the autoswitch keys; ui.theme has its
+        own menu."""
+        return [
+            row
+            for row in effective_settings(self.app.switcher.backup_dir)
+            if row[0].section == "autoswitch"
+        ]
+
+    def _settings_entries(self) -> MenuEntries:
+        """One row per setting: key, effective value, and whether it is the
+        default (absent from the file) — the same view as ``cswap config``."""
+        rows = self._setting_rows()
+        width = max(len(spec.json_key) for spec, _value, _set in rows)
+        entries: MenuEntries = []
+        for spec, value, is_set in rows:
+            shown = format_setting_value(value)
+            marker = "" if is_set else "  (default)"
+            entries.append(
+                (f"{spec.json_key:<{width}}  {shown}{marker}", f"setting:{spec.dotted}")
+            )
+        entries.append(_BACK)
+        return entries
+
+    def _choice_entries(self, dotted: str) -> MenuEntries:
+        spec = SETTING_SPECS[dotted]
+        current, is_set = next(
+            (value, is_set)
+            for s, value, is_set in self._setting_rows()
+            if s.dotted == dotted
+        )
+        entries: MenuEntries = [
+            (f"{'●' if choice == current else ' '} {choice}", f"set:{dotted}={choice}")
+            for choice in spec.choices
+        ]
+        if is_set:
+            entries.append(
+                (
+                    f"  reset to default ({format_setting_value(spec.default)})",
+                    f"unset:{dotted}",
+                )
+            )
+        entries.append(_BACK)
+        return entries
+
     async def _push_menu(self, title: str, entries: MenuEntries) -> None:
         self._menu_stack.append((title, entries))
         await self._render_menu()
@@ -137,6 +196,16 @@ class DashboardScreen(Screen):
         if len(self._menu_stack) > 1:
             self._menu_stack.pop()
             await self._render_menu()
+
+    async def _refresh_settings_menu(self, dotted: str) -> None:
+        """Re-render the settings list in place, cursor on ``dotted``'s row."""
+        title, _entries = self._menu_stack[-1]
+        entries = self._settings_entries()
+        self._menu_stack[-1] = (title, entries)
+        await self._render_menu()
+        self.query_one("#menu", ListView).index = next(
+            (i for i, (_l, a) in enumerate(entries) if a == f"setting:{dotted}"), 0
+        )
 
     async def _render_menu(self) -> None:
         title, entries = self._menu_stack[-1]
@@ -186,6 +255,17 @@ class DashboardScreen(Screen):
             app.apply_theme(name)
             app.notify(f"Theme: {name}")
             await self._pop_menu()
+        elif action_id == "settings-menu":
+            await self._push_menu("settings", self._settings_entries())
+        elif action_id.startswith("setting:"):
+            await self._edit_setting(action_id.split(":", 1)[1])
+        elif action_id.startswith("set:"):
+            dotted, value = action_id.split(":", 1)[1].split("=", 1)
+            await self._pop_menu()
+            await self._apply_setting(dotted, value)
+        elif action_id.startswith("unset:"):
+            await self._pop_menu()
+            await self._apply_setting(action_id.split(":", 1)[1], None)
         elif action_id == "disable-menu":
             await self._push_menu("disable / enable", self._disable_entries())
         elif action_id.startswith("disable:"):
@@ -194,6 +274,52 @@ class DashboardScreen(Screen):
             await self._pop_menu()
         else:
             actions[action_id]()
+
+    # -- settings ---------------------------------------------------------------
+
+    async def _edit_setting(self, dotted: str) -> None:
+        spec = SETTING_SPECS[dotted]
+        if spec.kind == "choice":
+            await self._push_menu(spec.json_key, self._choice_entries(dotted))
+            return
+        current = next(
+            value for s, value, _set in self._setting_rows() if s.dotted == dotted
+        )
+        if spec.kind == "bool":
+            await self._apply_setting(dotted, "false" if current else "true")
+            return
+        shown = "" if current is None else format_setting_value(current)
+
+        async def on_result(result: object) -> None:
+            if result is RESET_TO_DEFAULT:
+                await self._apply_setting(dotted, None)
+            elif isinstance(result, str):
+                await self._apply_setting(dotted, result)
+
+        self.app.push_screen(SettingInputModal(spec, shown), on_result)
+
+    async def _apply_setting(self, dotted: str, raw: str | None) -> None:
+        """Persist one key (``None`` = back to default) and re-render."""
+        app = self.app
+        backup_dir = app.switcher.backup_dir
+        try:
+            if raw is None:
+                unset_setting(backup_dir, dotted)
+            else:
+                set_setting(backup_dir, dotted, raw)
+        except ConfigError as exc:
+            app.notify(str(exc), severity="error")
+            return
+        if dotted == "autoswitch.threshold":
+            # The bar tick everywhere reads app.threshold_pct.
+            app.threshold_pct = load_settings(backup_dir).threshold
+            self.query_one("#accounts-panel", AccountsPanel).refresh()
+        spec = SETTING_SPECS[dotted]
+        value = next(
+            value for s, value, _set in self._setting_rows() if s.dotted == dotted
+        )
+        app.notify(f"{spec.json_key}: {format_setting_value(value)}")
+        await self._refresh_settings_menu(dotted)
 
     # -- actions ----------------------------------------------------------------
 

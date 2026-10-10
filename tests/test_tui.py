@@ -805,6 +805,7 @@ class TestDashboard:
                 "add-menu",
                 "disable-menu",
                 "remove-menu",
+                "settings-menu",
                 "theme-menu",
                 "quit",
             ]
@@ -1738,3 +1739,111 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+@pytest.mark.asyncio
+class TestSettingsMenu:
+    """Main menu → Settings: edits settings.json like ``cswap config``."""
+
+    @staticmethod
+    def _labels(app) -> list[str]:
+        from textual.widgets import ListView, Static
+
+        from claude_swap.tui.widgets import MenuItem
+
+        menu = app.screen.query_one("#menu", ListView)
+        return [it.query_one(Static).render().plain for it in menu.query(MenuItem)]
+
+    @staticmethod
+    def _autoswitch(tmp_path) -> dict:
+        path = tmp_path / "settings.json"
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text()).get("autoswitch", {})
+
+    async def test_lists_autoswitch_keys_with_defaults_marked(self, tmp_path):
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1, "autoswitch": {"threshold": 80.0},
+        }))
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "settings-menu")
+            labels = self._labels(app)
+            threshold = next(lbl for lbl in labels if "threshold" in lbl)
+            assert "80" in threshold and "(default)" not in threshold
+            strategy = next(lbl for lbl in labels if "strategy" in lbl)
+            assert "best" in strategy and "(default)" in strategy
+            assert not any("theme" in lbl for lbl in labels)  # own menu
+
+    async def test_choice_submenu_sets_and_resets_strategy(self, tmp_path):
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "settings-menu")
+            await menu_select(pilot, "setting:autoswitch.strategy")
+            labels = self._labels(app)
+            assert "●" in next(lbl for lbl in labels if lbl.endswith(" best"))
+            await menu_select(pilot, "set:autoswitch.strategy=consume-first-5h")
+            assert self._autoswitch(tmp_path)["strategy"] == "consume-first-5h"
+            # back on the settings list, cursor on the edited row
+            from textual.widgets import ListView
+
+            menu = app.screen.query_one("#menu", ListView)
+            assert menu.highlighted_child.action_id == "setting:autoswitch.strategy"
+            # reset to default removes the key from the file
+            await menu_select(pilot, "setting:autoswitch.strategy")
+            await menu_select(pilot, "unset:autoswitch.strategy")
+            assert "strategy" not in self._autoswitch(tmp_path)
+
+    async def test_bool_toggles_in_place(self, tmp_path):
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "settings-menu")
+            await menu_select(pilot, "setting:autoswitch.includeApiKeyAccounts")
+            assert self._autoswitch(tmp_path)["includeApiKeyAccounts"] is True
+            labels = self._labels(app)
+            assert "true" in next(lbl for lbl in labels if "includeApiKey" in lbl)
+
+    async def test_threshold_modal_validates_saves_and_updates_tick(self, tmp_path):
+        from textual.widgets import Input, Static
+
+        from claude_swap.tui.modals import SettingInputModal
+
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "settings-menu")
+            await menu_select(pilot, "setting:autoswitch.threshold")
+            assert isinstance(app.screen, SettingInputModal)
+            field = app.screen.query_one("#setting-value", Input)
+            assert field.value == "90"  # prefilled with the current value
+            field.value = "200"
+            await pilot.press("enter")
+            await pilot.pause()
+            # out of range: stays open with the CLI's error message
+            assert isinstance(app.screen, SettingInputModal)
+            error = app.screen.query_one("#form-error", Static).render().plain
+            assert "between" in error
+            field.value = "85"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not isinstance(app.screen, SettingInputModal)
+            assert self._autoswitch(tmp_path)["threshold"] == 85.0
+            assert app.threshold_pct == 85.0
+
+    async def test_input_modal_default_button_unsets(self, tmp_path):
+        from claude_swap.tui.modals import SettingInputModal
+
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1, "autoswitch": {"cooldownSeconds": 60.0},
+        }))
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "settings-menu")
+            await menu_select(pilot, "setting:autoswitch.cooldownSeconds")
+            assert isinstance(app.screen, SettingInputModal)
+            await pilot.click("#reset")
+            await pilot.pause()
+            assert "cooldownSeconds" not in self._autoswitch(tmp_path)

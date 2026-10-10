@@ -11,6 +11,13 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Static
 
+from claude_swap.exceptions import ConfigError
+from claude_swap.settings import (
+    SettingSpec,
+    format_setting_value,
+    parse_setting_value,
+)
+
 
 class ConfirmModal(ModalScreen[bool]):
     """Yes/No confirmation. Dismisses with True only on explicit confirm.
@@ -128,6 +135,75 @@ class AddTokenModal(ModalScreen["TokenForm | None"]):
                 self.query_one("#form-error", Static).update("Slot must be >= 1.")
                 return
         self.dismiss(TokenForm(token=token, email=email, slot=slot))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+RESET_TO_DEFAULT = object()  # SettingInputModal result: unset the key
+
+
+class SettingInputModal(ModalScreen[object]):
+    """Edit one numeric/string setting.
+
+    Dismisses with the validated raw string, :data:`RESET_TO_DEFAULT`, or
+    None (cancel). Validation is ``parse_setting_value`` — the same strict
+    check ``cswap config set`` runs — so a bad value is reported here instead
+    of being clamped silently on the next load.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("left", "app.focus_previous", show=False),
+        Binding("right", "app.focus_next", show=False),
+    ]
+
+    def __init__(self, spec: SettingSpec, current: str) -> None:
+        super().__init__()
+        self._spec = spec
+        self._current = current
+
+    def compose(self) -> ComposeResult:
+        spec = self._spec
+        body = spec.help
+        if spec.lo is not None and spec.hi is not None:
+            body += (
+                f"\n\nRange {format_setting_value(spec.lo)}–"
+                f"{format_setting_value(spec.hi)}"
+            )
+        body += f"  ·  default {format_setting_value(spec.default)}"
+        with Vertical(classes="modal-box"):
+            yield Label(spec.dotted, classes="modal-title")
+            yield Static(body, classes="modal-body")
+            yield Input(value=self._current, id="setting-value")
+            yield Static("", id="form-error", classes="form-error")
+            with Horizontal(classes="modal-buttons"):
+                yield Button("Save", id="save")
+                yield Button("Default", id="reset")
+                yield Button("Cancel", id="cancel")
+            yield Static(
+                "enter save  ·  tab next  ·  esc cancel", classes="modal-hint"
+            )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+        elif event.button.id == "reset":
+            self.dismiss(RESET_TO_DEFAULT)
+        else:
+            self._submit()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        raw = self.query_one("#setting-value", Input).value.strip()
+        try:
+            parse_setting_value(self._spec, raw)
+        except ConfigError as exc:
+            self.query_one("#form-error", Static).update(str(exc))
+            return
+        self.dismiss(raw)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
