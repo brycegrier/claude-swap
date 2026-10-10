@@ -1351,6 +1351,29 @@ class TestAutoScreen:
 
             assert len(app.screen.query_one("#event-log", RichLog).lines) > 0
 
+    async def test_tui_starts_live_setting_opens_live(self, tmp_path, fake_engine):
+        """autoswitch.tuiStartsLive is the go-live confirmation made in
+        advance: the view opens live, says why, and `l` still drops back."""
+        from textual.widgets import RichLog
+
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1, "autoswitch": {"tuiStartsLive": True},
+        }))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            assert fake_engine.instances[0].dry_run is False
+            log = app.screen.query_one("#event-log", RichLog)
+            started = " ".join(line.text for line in log.lines)
+            assert "LIVE" in started and "tuiStartsLive" in started
+            await pilot.press("l")  # live → dry-run needs no confirmation
+            await pilot.pause()
+            assert fake_engine.instances[-1].dry_run is True
+
     async def test_go_live_requires_confirmation(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path

@@ -98,6 +98,11 @@ class TestLoadSettings:
         set_setting(tmp_path, "autoswitch.strategy", "consume-first")
         assert load_settings(tmp_path).strategy == "consume-first"
 
+    def test_tui_starts_live_defaults_off_and_round_trips(self, tmp_path: Path):
+        assert load_settings(tmp_path).tui_starts_live is False
+        set_setting(tmp_path, "autoswitch.tuiStartsLive", "true")
+        assert load_settings(tmp_path).tui_starts_live is True
+
     def test_consume_first_5h_is_a_valid_strategy(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
             json.dumps({"autoswitch": {"strategy": "consume-first-5h"}})

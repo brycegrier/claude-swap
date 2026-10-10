@@ -2,7 +2,9 @@
 
 Runs :class:`AutoSwitchEngine` in a thread worker and renders its typed
 events. Opens in **dry-run** — opening a view must never start switching
-accounts on its own; going live is an explicit, confirmed action. The
+accounts on its own; going live is an explicit, confirmed action. Setting
+``autoswitch.tuiStartsLive`` is that explicit action made once, in advance:
+the view then opens live. The
 engine's own state file semantics (shared cooldown, quarantine list, state
 lock) make it safe to run alongside an external ``cswap auto``.
 
@@ -132,7 +134,10 @@ class AutoScreen(Screen):
         self.app.threshold_pct = self._settings.threshold
         self._update_summary()
         self.watch(self.app, "theme", self._on_theme_change)
-        self._start_engine(dry_run=True)
+        live = self._settings.tui_starts_live
+        self._start_engine(
+            dry_run=not live, note="autoswitch.tuiStartsLive" if live else None
+        )
 
     def on_unmount(self) -> None:
         if self._engine is not None:
@@ -225,7 +230,7 @@ class AutoScreen(Screen):
 
     # -- engine -------------------------------------------------------------
 
-    def _start_engine(self, *, dry_run: bool) -> None:
+    def _start_engine(self, *, dry_run: bool, note: str | None = None) -> None:
         engine = AutoSwitchEngine(
             self.app.switcher,
             self._settings,
@@ -243,6 +248,8 @@ class AutoScreen(Screen):
         self._update_badge()
         log = self.query_one("#event-log", RichLog)
         mode = "DRY-RUN (watching only)" if dry_run else "LIVE (will switch accounts)"
+        if note:
+            mode += f" · {note}"
         log.write(
             Text(
                 f"— engine started: {mode} —",

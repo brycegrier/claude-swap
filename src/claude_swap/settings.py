@@ -59,6 +59,10 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Whether the TUI's auto-switch view starts its engine live instead of in
+    # dry-run. TUI-only: `cswap auto` is always live unless --dry-run, so the
+    # CLI ignores this. The default keeps "opening a view never switches".
+    tui_starts_live: bool = False
 
 
 @dataclass(frozen=True)
@@ -136,6 +140,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "tuiStartsLive", "tui_starts_live", "bool",
+            help="Start the TUI auto-switch view live instead of in dry-run",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
