@@ -98,6 +98,16 @@ class TestLoadSettings:
         set_setting(tmp_path, "autoswitch.strategy", "consume-first")
         assert load_settings(tmp_path).strategy == "consume-first"
 
+    def test_consume_first_5h_is_a_valid_strategy(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"strategy": "consume-first-5h"}})
+        )
+        assert load_settings(tmp_path).strategy == "consume-first-5h"
+
+    def test_set_strategy_consume_first_5h(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.strategy", "consume-first-5h")
+        assert load_settings(tmp_path).strategy == "consume-first-5h"
+
 
 class TestSaveSettings:
     def test_roundtrip(self, tmp_path: Path):
@@ -280,6 +290,12 @@ class TestMergedWithCli:
     def test_strategy_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="consume-first"))
         assert merged.strategy == "consume-first"
+
+    def test_strategy_override_consume_first_5h(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(), _args(strategy="consume-first-5h")
+        )
+        assert merged.strategy == "consume-first-5h"
 
 
 class TestAtomicWriteThroughSymlink:

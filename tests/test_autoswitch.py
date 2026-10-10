@@ -3183,6 +3183,81 @@ class TestConsumeFirstStrategy:
         assert sw.trigger == "at-limit"
 
 
+def _usage5(
+    pct5: float, pct7: float, reset5: str | None = None, reset7: str | None = None
+) -> dict:
+    """Usage with an explicit 5-hour reset (and optional weekly reset)."""
+    five: dict = {"pct": pct5}
+    if reset5:
+        five["resets_at"] = reset5
+    seven: dict = {"pct": pct7}
+    if reset7:
+        seven["resets_at"] = reset7
+    return {"five_hour": five, "seven_day": seven}
+
+
+class TestConsumeFirst5hStrategy:
+    """consume-first-5h: the consume-first machinery, ranked by the 5h window."""
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="consume-first-5h")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_below_threshold_switches_to_soonest_5h_reset(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage5(20, 20, _R_LATER),
+            "2": _usage5(10, 10, _R_SOON),
+            "3": _usage5(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        # Same trigger as the weekly variant: the event contract is unchanged.
+        assert sw.trigger == "consume-first"
+
+    def test_stays_when_active_already_resets_soonest(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage5(20, 20, _R_SOON),
+            "2": _usage5(10, 10, _R_LATER),
+            "3": _usage5(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]
+
+    def test_ranks_by_5h_not_weekly(self, temp_home):
+        # Weekly ordering is the exact reverse of 5h ordering: the weekly
+        # strategy would pick #3, the 5h strategy must pick #2.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage5(20, 20, _R_LATER, _R_LATER),
+            "2": _usage5(10, 10, _R_SOON, _R_LATEST),
+            "3": _usage5(10, 10, _R_LATEST, _R_SOON),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_unknown_active_5h_reset_holds(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage5(20, 20, None, _R_LATEST),  # weekly known, 5h not
+            "2": _usage5(10, 10, _R_SOON),
+            "3": _usage5(10, 10, _R_LATER),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        holds = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert [e.reason for e in holds] == ["reset-unknown"]
+        assert "5-hour" in holds[0].detail
+
+
 class TestConsumeFirstDepartureRecordsItsOwnTrigger:
     """A `consume-first` departure's phase-2 refetch can write
     `(leftHeadroom, leftRecoveryAt) = (None, None)`, the exact snapshot
