@@ -41,7 +41,8 @@ class TestIntervalAdaptation:
         # ramp start, so the first plan is already the long wait.
         _, active = _plan(is_active=True)
         _, candidate = _plan(is_active=False)
-        assert active == poll_policy.ACTIVE_FAR_INTERVAL_S
+        # 10% used at threshold 90: 80 points left → 800s.
+        assert active == poll_policy.active_interval_for(10.0, 90.0) == 800.0
         assert candidate == poll_policy.CANDIDATE_DEFAULT_INTERVAL_S
 
     def test_unmoved_decays_toward_the_ceiling(self):
@@ -50,11 +51,11 @@ class TestIntervalAdaptation:
         _, capped = _plan(prev_interval_s=700.0, prev_usage=_usage(10))
         # Candidates now stretch as far as the active ramp's longest wait.
         assert capped == max(poll_policy.CANDIDATE_MAX_INTERVAL_S, poll_policy.ACTIVE_FAR_INTERVAL_S)
-        # The active account does not decay at all — room left sets it.
+        # The active account does not decay at all — points left set it.
         _, active = _plan(
             prev_interval_s=250.0, prev_usage=_usage(10), is_active=True
         )
-        assert active == poll_policy.ACTIVE_FAR_INTERVAL_S
+        assert active == poll_policy.active_interval_for(10.0, 90.0)
 
     def test_movement_halves_floored_at_min(self):
         _, interval = _plan(
@@ -79,52 +80,99 @@ class TestIntervalAdaptation:
         assert interval == poll_policy.CANDIDATE_DEFAULT_INTERVAL_S
 
 
-class TestUrgentMode:
-    def _urgent_kwargs(self, **overrides):
-        kwargs = dict(
-            prev_interval_s=poll_policy.MIN_INTERVAL_S,
-            prev_usage=_usage(78),
-            new_usage=_usage(82),  # moving, inside the 75..90 band
-            is_active=True,
-            threshold=90.0,
+class TestActiveCadence:
+    """The active account waits in proportion to the points left before the
+    threshold — room left only, no measured burn speed."""
+
+    def test_table(self):
+        f = poll_policy.active_interval_for
+        # Defaults: 3%/min assumed burn, half-margin → 10s per point left.
+        assert f(50.0, 99.0) == pytest.approx(490.0)
+        assert f(76.0, 99.0) == pytest.approx(230.0)
+        assert f(83.0, 99.0) == pytest.approx(160.0)
+        assert f(90.0, 99.0) == pytest.approx(90.0)
+        assert f(96.0, 99.0) == poll_policy.ACTIVE_MIN_INTERVAL_S  # 30s floor
+        assert f(5.0, 99.0) == poll_policy.ACTIVE_FAR_INTERVAL_S   # 15m max
+        assert f(99.5, 99.0) == poll_policy.ACTIVE_MIN_INTERVAL_S  # past it
+        assert f(None, 99.0) == poll_policy.MIN_INTERVAL_S         # unknown
+
+    def test_assumed_burn_scales_the_waits(self):
+        f = poll_policy.active_interval_for
+        assert f(83.0, 99.0, burn_pct_per_min=6.0) == pytest.approx(80.0)
+        assert f(83.0, 99.0, burn_pct_per_min=1.5) == pytest.approx(320.0)
+
+    def _active(self, pct: float, **kw):
+        return _plan(
+            is_active=True, threshold=99.0, prev_interval_s=180.0,
+            prev_usage=_usage(pct), new_usage=_usage(pct), **kw,
+        )[1]
+
+    def test_movement_does_not_matter(self):
+        moved = _plan(
+            is_active=True, threshold=99.0, prev_usage=_usage(80),
+            new_usage=_usage(90),
+        )[1]
+        assert moved == self._active(90.0)
+
+    def test_budget_guard_stretches_fast_polls(self):
+        # A rested bucket (one request: this one) allows the 30s floor.
+        assert self._active(96.0, fetch_log=(NOW,)) == 30.0
+        # Eight requests in the last 35s drained it: wait for a token, which
+        # here is more than a full refill interval away.
+        drained = tuple(NOW - 5.0 * k for k in range(8))
+        assert self._active(96.0, fetch_log=drained) > poll_policy.MIN_INTERVAL_S
+        # The bucket only ever lengthens a wait: far from the limit the 490s
+        # plan stands unless the overdrawn bucket needs longer still.
+        assert self._active(50.0, fetch_log=drained) == pytest.approx(
+            max(490.0, poll_policy.next_token_at(drained) - NOW)
         )
-        kwargs.update(overrides)
-        return kwargs
+        assert self._active(50.0, fetch_log=(NOW,)) == pytest.approx(490.0)
 
-    def test_active_moving_in_band_goes_urgent(self):
-        _, interval = _plan(**self._urgent_kwargs())
-        assert interval == poll_policy.URGENT_INTERVAL_S
-
-    def test_candidate_never_goes_urgent(self):
-        _, interval = _plan(**self._urgent_kwargs(is_active=False))
-        assert interval == poll_policy.MIN_INTERVAL_S  # plain movement halving
-
-    def test_no_movement_no_urgency(self):
-        _, interval = _plan(**self._urgent_kwargs(new_usage=_usage(78)))
-        assert interval > poll_policy.URGENT_INTERVAL_S
-
-    def test_below_the_band_no_urgency(self):
-        # Moving, but below the burst start: the ramp, not a burst.
-        _, interval = _plan(
-            **self._urgent_kwargs(prev_usage=_usage(40), new_usage=_usage(50))
+    def test_next_token_at(self):
+        f = poll_policy.next_token_at
+        assert f(()) is None
+        assert f((100.0,)) == 100.0  # plenty of tokens left
+        n = poll_policy.FAST_POLL_BURST
+        burst = tuple(100.0 + k for k in range(n))
+        # Drained to the refill earned during the burst ((n-1)s of 180s):
+        # the next whole token is the rest of one refill interval away.
+        refilled = (n - 1) / poll_policy.MIN_INTERVAL_S
+        assert f(burst) == pytest.approx(
+            burst[-1] + (1.0 - refilled) * poll_policy.MIN_INTERVAL_S
         )
-        assert interval == poll_policy.active_interval_for(50.0, 90.0)
-        assert interval > poll_policy.URGENT_INTERVAL_S
 
-    def test_recent_429_suppresses_urgency(self):
-        _, interval = _plan(**self._urgent_kwargs(recent_429=True))
-        assert interval == poll_policy.POST_429_MIN_INTERVAL_S
+    def test_recent_429_still_floors_the_cadence(self):
+        assert self._active(96.0, recent_429=True) >= poll_policy.POST_429_MIN_INTERVAL_S
 
-    def test_urgent_then_unmoved_snaps_back_to_the_floor(self):
-        # Once movement stops, the next interval is the normal floor — never
-        # a sub-floor decay chain (60 → 90 → 135 …) off the urgent base.
-        _, interval = _plan(
-            **self._urgent_kwargs(
-                prev_interval_s=poll_policy.URGENT_INTERVAL_S,
-                new_usage=_usage(78),  # unmoved
-            )
+    def test_parked_near_the_limit_stays_under_the_hourly_cap(self):
+        """Idle at 96% for two hours: fast polls until the budget is spent,
+        then MIN_INTERVAL_S — never more than the measured ~28/hour."""
+        t, polls = NOW, []
+        while t < NOW + 7200.0:
+            polls.append(t)
+            log = tuple(p for p in polls if t - 3600.0 < p <= t)
+            t += _plan(
+                is_active=True, threshold=99.0, prev_usage=_usage(96),
+                new_usage=_usage(96), now=t, fetch_log=log,
+            )[1]
+        window = max(
+            sum(1 for p in polls if start <= p < start + 3600.0) for start in polls
         )
-        assert interval == poll_policy.MIN_INTERVAL_S
+        # The bucket's own bound: burst + one per MIN_INTERVAL_S.
+        bound = poll_policy.FAST_POLL_BURST + 3600.0 / poll_policy.MIN_INTERVAL_S
+        assert window <= bound <= 26
+
+    def test_the_measured_climb_is_caught_before_the_threshold(self):
+        """Replays the reported episode: 83% → 96% in five minutes (2.6%/min).
+        Each poll must land before the burn covers the points left."""
+        t, pct, rate = 0.0, 83.0, 2.6 / 60.0
+        while pct < 99.0:
+            wait = self._active(pct)
+            assert pct + rate * wait < 99.0 + rate * 30.0  # at most one floor poll over
+            t += wait
+            pct = min(99.0, pct + rate * wait)
+            if 99.0 - pct < 0.5:
+                break
 
 
 class TestPost429Floor:
@@ -227,80 +275,6 @@ class TestPost429Aimd:
         traj = self._converge_trajectory(recent_429=False)
         assert max(traj) == max(poll_policy.CANDIDATE_MAX_INTERVAL_S, poll_policy.ACTIVE_FAR_INTERVAL_S)
         assert max(poll_policy.CANDIDATE_MAX_INTERVAL_S, poll_policy.ACTIVE_FAR_INTERVAL_S) < poll_policy.POST_429_MAX_INTERVAL_S
-
-
-class TestActiveRamp:
-    """The active account's cadence ramps on room left (not burn speed)."""
-
-    def test_table(self):
-        f = poll_policy.active_interval_for
-        far, floor = poll_policy.ACTIVE_FAR_INTERVAL_S, poll_policy.MIN_INTERVAL_S
-        kw = dict(ramp_start_pct=50.0, far_interval_s=900.0, burst_start_pct=90.0)
-        assert f(10.0, 99.0, **kw) == far
-        assert f(50.0, 99.0, **kw) == far
-        assert f(90.0, 99.0, **kw) == floor
-        assert f(95.0, 99.0, **kw) == floor
-        # straight line between: 70% is halfway from 900s to 180s
-        assert f(70.0, 99.0, **kw) == pytest.approx((far + floor) / 2)
-        assert f(None, 99.0, **kw) == floor  # unknown: don't wait long
-
-    def test_burst_start_past_threshold_ends_the_ramp_at_the_threshold(self):
-        f = poll_policy.active_interval_for
-        kw = dict(ramp_start_pct=50.0, far_interval_s=900.0, burst_start_pct=95.0)
-        assert f(80.0, 80.0, **kw) == poll_policy.MIN_INTERVAL_S
-        # ramp start beyond the end collapses onto it instead of dividing by 0
-        assert f(60.0, 40.0, ramp_start_pct=70.0, burst_start_pct=95.0) == (
-            poll_policy.MIN_INTERVAL_S
-        )
-
-    def _active(self, prev: float, new: float, **kw):
-        return _plan(
-            is_active=True,
-            threshold=99.0,
-            prev_interval_s=poll_policy.MIN_INTERVAL_S,
-            prev_usage=_usage(prev),
-            new_usage=_usage(new),
-            burst_start_pct=90.0,
-            burst_interval_s=30.0,
-            **kw,
-        )[1]
-
-    def test_burst_needs_the_burst_zone_and_movement(self):
-        assert self._active(91, 92) == 30.0          # in zone, moving
-        assert self._active(92, 92) == poll_policy.MIN_INTERVAL_S  # paused
-        assert self._active(80, 85) > 30.0            # moving, below zone
-        assert self._active(91, 92, recent_429=True) >= (
-            poll_policy.POST_429_MIN_INTERVAL_S
-        )
-
-    def test_ramp_ignores_movement_below_the_burst_zone(self):
-        assert self._active(20, 30) == self._active(30, 30)
-
-    def test_burst_episode_fits_the_hourly_budget(self):
-        """A heavy end-of-window climb plus the ramp polls before it stays
-        under the measured ~28-30 requests per rolling hour.
-
-        Simulated: 30 minutes climbing 60→90 on the ramp, then 90→99 in
-        1-point steps with a pause (an unmoved 3-minute poll) after every
-        rise — the most polls a movement-gated burst can be driven to.
-        """
-        t, pct, prev, polls = 0.0, 60.0, 60.0, []
-        while t < 1800.0:
-            interval = self._active(prev, pct)
-            polls.append(t)
-            prev, t = pct, t + interval
-            pct = min(90.0, pct + 30.0 * interval / 1800.0)
-        pct, prev = 90.0, 89.0
-        while pct < 99.0:
-            for nxt in (pct + 1.0, pct + 1.0):  # rise, then a pause
-                interval = self._active(prev, nxt)
-                polls.append(t)
-                prev, t = nxt, t + interval
-            pct += 1.0
-        window = max(
-            sum(1 for p in polls if start <= p < start + 3600.0) for start in polls
-        )
-        assert window <= 28
 
 
 class TestResetCapping:

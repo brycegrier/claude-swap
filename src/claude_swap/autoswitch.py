@@ -2172,20 +2172,24 @@ class AutoSwitchEngine:
         # over from a role change the switcher never saw (e.g. a manual
         # login) is overridden past the active age cap. Exhausted accounts
         # carry their own bounded plan and become due normally.
-        # The cap is the active ramp's own interval at this utilization, so a
-        # deliberate long wait with lots of room left is never mistaken for a
-        # leftover candidate plan.
+        # The cap is the active cadence's own wait at this utilization (never
+        # below the steady floor, so a budget-stretched 3-minute plan is not
+        # "stale" either), so a deliberate long wait with lots of room left is
+        # never mistaken for a leftover candidate plan.
         active_pre_pct = (
             binding_pct(active_pre.last_good, self._models)
             if active_pre is not None
             else None
         )
-        active_cap = poll_policy.active_interval_for(
-            active_pre_pct,
-            threshold if threshold is not None else self.settings.threshold,
-            **poll_policy.PollInputs.from_settings(
-                self.settings, self._models
-            ).ramp_kwargs(),
+        active_cap = max(
+            poll_policy.MIN_INTERVAL_S,
+            poll_policy.active_interval_for(
+                active_pre_pct,
+                threshold if threshold is not None else self.settings.threshold,
+                **poll_policy.PollInputs.from_settings(
+                    self.settings, self._models
+                ).ramp_kwargs(),
+            ),
         )
         stale_candidate_plan = (
             active_pre is not None

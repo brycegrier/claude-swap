@@ -37,9 +37,9 @@ class AutoSwitchSettings:
     at or above it the engine looks for a better account. 90 rather than 95
     leaves margin for the macOS ~30s Keychain pickup tail and for heavy
     subagent turns burning past the mark before a swap lands. Thresholds in
-    the high 90s rely on the burst cadence (``poll_burst_*``): from the burst
-    start, every observed rise is re-polled within ``poll_burst_interval_s``,
-    so the overshoot past the mark is about one burst interval of usage. A
+    the high 90s rely on the active cadence (``poll_*``): the wait shrinks
+    with the points left, down to ``poll_min_interval_seconds`` near the
+    mark, so the overshoot is about one short poll interval of usage. A
     proactive candidate must itself sit below the threshold (never land
     somewhere that re-triggers next tick) and beat the active account's
     utilization by at least ``hysteresis_pct``, so two accounts hovering at
@@ -71,14 +71,13 @@ class AutoSwitchSettings:
     # dry-run. TUI-only: `cswap auto` is always live unless --dry-run, so the
     # CLI ignores this. The default keeps "opening a view never switches".
     tui_starts_live: bool = False
-    # Usage poll ramp for the active account (see poll_policy): wait
-    # poll_max_interval_seconds at or below poll_ramp_start_pct used, shorten
-    # linearly to 3 min at poll_burst_start_pct, and poll every
-    # poll_burst_interval_seconds from there while usage keeps rising.
-    poll_ramp_start_pct: float = 50.0
+    # Active-account usage cadence (see poll_policy.active_interval_for):
+    # wait in proportion to the points left before the threshold, sized for
+    # a burn of up to poll_assumed_burn_pct_per_min, clamped to
+    # [poll_min_interval_seconds, poll_max_interval_seconds].
+    poll_assumed_burn_pct_per_min: float = 3.0
+    poll_min_interval_seconds: float = 30.0
     poll_max_interval_seconds: float = 900.0
-    poll_burst_start_pct: float = 75.0
-    poll_burst_interval_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -162,22 +161,19 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Start the TUI auto-switch view live instead of in dry-run",
         ),
         SettingSpec(
-            "autoswitch", "pollRampStartPct", "poll_ramp_start_pct", "float", 0.0, 99.0,
-            help="Below this pct used, poll usage at the max interval",
+            "autoswitch", "pollAssumedBurnPctPerMin", "poll_assumed_burn_pct_per_min",
+            "float", 0.5, 20.0,
+            help="Fastest burn to plan for (pct/min); higher = poll sooner near the limit",
+        ),
+        SettingSpec(
+            "autoswitch", "pollMinIntervalSeconds", "poll_min_interval_seconds",
+            "float", 20.0, 180.0,
+            help="Shortest wait between usage polls (right at the limit)",
         ),
         SettingSpec(
             "autoswitch", "pollMaxIntervalSeconds", "poll_max_interval_seconds",
             "float", 180.0, 3600.0,
             help="Longest wait between usage polls (lots of room left)",
-        ),
-        SettingSpec(
-            "autoswitch", "pollBurstStartPct", "poll_burst_start_pct", "float", 0.0, 99.9,
-            help="From this pct used, poll fast while usage keeps rising",
-        ),
-        SettingSpec(
-            "autoswitch", "pollBurstIntervalSeconds", "poll_burst_interval_seconds",
-            "float", 20.0, 180.0,
-            help="Wait between usage polls during a burst",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

@@ -735,10 +735,9 @@ Defaults live in settings.json in the backup root; flags override them.
                 dimmed(
                     f"Auto-switch running: threshold "
                     f"{pct_label(settings.threshold)}%, usage polls every "
-                    f"{settings.poll_max_interval_seconds / 60:.0f}m below "
-                    f"{pct_label(settings.poll_ramp_start_pct)}% used, "
-                    f"{settings.poll_burst_interval_seconds:.0f}s bursts from "
-                    f"{pct_label(settings.poll_burst_start_pct)}%"
+                    f"{settings.poll_min_interval_seconds:.0f}s-"
+                    f"{settings.poll_max_interval_seconds / 60:.0f}m, sooner "
+                    f"the less room is left"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )

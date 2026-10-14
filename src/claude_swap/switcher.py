@@ -5216,7 +5216,12 @@ class ClaudeAccountSwitcher:
                 models=inputs.models,
                 recent_429=recent_429,
                 now=now,
-                burst_interval_s=inputs.burst_interval_s,
+                # Every request in the trailing hour (any surface on this
+                # machine) plus this one: the planner's request-budget bucket.
+                fetch_log=tuple(
+                    t for t in (before.fetch_log if before else ())
+                    if now - 3600.0 < t <= now
+                ) + (now,),
                 **inputs.ramp_kwargs(),
             )
         return plans

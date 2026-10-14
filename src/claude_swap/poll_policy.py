@@ -79,24 +79,31 @@ SERVE_TTL_S = 180.0
 # below.
 MIN_INTERVAL_S = 180.0
 
-# Burst ("urgent") mode: the ACTIVE account at/above BURST_START_PCT used,
-# with movement observed this poll (i.e. actually burning toward the limit).
-# Bounded by construction, not by speed: each burst poll needs a fresh
-# MOVEMENT_DELTA_PCT rise, so an episode costs about (threshold - burst
-# start) / delta polls plus a MIN_INTERVAL_S poll whenever usage pauses —
-# 90→99 is ~9 burst polls — inside the measured ~28-30 request rolling-hour
-# window; overshoot on top of steady traffic is absorbed by the post-429
-# floor below. Both are settings (autoswitch.pollBurstStartPct /
-# pollBurstIntervalSeconds); these are the defaults.
-URGENT_INTERVAL_S = 60.0
-BURST_START_PCT = 75.0
-
-# The active account's not-moving cadence ramps on ROOM LEFT: at or below
-# RAMP_START_PCT used it waits ACTIVE_FAR_INTERVAL_S, shortening linearly to
-# MIN_INTERVAL_S at the burst start (see active_interval_for). Settings
-# autoswitch.pollRampStartPct / pollMaxIntervalSeconds; these are defaults.
-RAMP_START_PCT = 50.0
+# The ACTIVE account's wait is proportional to the POINTS LEFT before the
+# switch threshold: sized so that even a fast burn (ASSUMED_BURN_PCT_PER_MIN)
+# covers at most WAIT_SAFETY of the remaining room before the next poll.
+# Room left only — no measured speed (usage is bursty; a measured rate is
+# stale the moment it is taken). At the defaults each point of room is worth
+# 10s: 49 points → ~8 min, 16 → ~2.7 min, 3 → the 30s floor. Measured on the
+# user's account: +13 points in 5 minutes (~2.6%/min), which the old fixed
+# 50%→90% line missed by waiting 5 minutes at 83%. Settings
+# autoswitch.pollAssumedBurnPctPerMin / pollMinIntervalSeconds /
+# pollMaxIntervalSeconds; these are the defaults.
+ASSUMED_BURN_PCT_PER_MIN = 3.0
+WAIT_SAFETY = 0.5
+ACTIVE_MIN_INTERVAL_S = 30.0
 ACTIVE_FAR_INTERVAL_S = 900.0
+
+# Budget guard: a token bucket over the account's request log (fetchLog —
+# every surface on this machine). Capacity FAST_POLL_BURST, refilled at one
+# token per MIN_INTERVAL_S. A poll may be planned only when a token is
+# available, so any trailing hour holds at most FAST_POLL_BURST + 3600 /
+# MIN_INTERVAL_S = 26 requests, under the measured ~28-30/hour block. Far
+# from the limit the bucket refills; near it, fast polls spend the bank and
+# the cadence settles at MIN_INTERVAL_S rather than going blind. (A plain
+# "N in the last hour" count cannot do this: the steady polls after a burst
+# land ON TOP of it — measured in simulation, 22 + 16 = 38 in one hour.)
+FAST_POLL_BURST = 6
 
 # Decay ceilings for an idle alternate (candidates still adapt on movement).
 # The ceiling actually used is max(CANDIDATE_MAX_INTERVAL_S, far interval):
@@ -149,8 +156,8 @@ POST_429_BACKOFF_MULT = 1.5
 POST_429_MAX_INTERVAL_S = 1800.0
 
 # The engine escalates to a full candidate refresh when the active account is
-# within this margin of the threshold (decision policy, but the urgent-mode
-# cadence keys on the same band, so it lives with the cadence numbers).
+# within this margin of the threshold (decision policy, kept beside the
+# cadence numbers it interacts with).
 ESCALATION_MARGIN_PCT = 15.0
 
 # Never schedule a poll later than a known window reset (+ slack): stored
@@ -161,14 +168,13 @@ RESET_SLACK_S = 60.0
 @dataclass(frozen=True)
 class PollInputs:
     """Everything poll planning keys on, from the effective settings: the
-    switch threshold, the scoped models, and the ramp/burst knobs."""
+    switch threshold, the scoped models, and the active-cadence knobs."""
 
     threshold: float
     models: tuple[str, ...] = ()
-    ramp_start_pct: float = RAMP_START_PCT
+    burn_pct_per_min: float = ASSUMED_BURN_PCT_PER_MIN
+    min_interval_s: float = ACTIVE_MIN_INTERVAL_S
     far_interval_s: float = ACTIVE_FAR_INTERVAL_S
-    burst_start_pct: float = BURST_START_PCT
-    burst_interval_s: float = URGENT_INTERVAL_S
 
     @classmethod
     def from_settings(cls, settings, models: tuple[str, ...]) -> "PollInputs":
@@ -176,18 +182,17 @@ class PollInputs:
         return cls(
             threshold=settings.threshold,
             models=models,
-            ramp_start_pct=settings.poll_ramp_start_pct,
+            burn_pct_per_min=settings.poll_assumed_burn_pct_per_min,
+            min_interval_s=settings.poll_min_interval_seconds,
             far_interval_s=settings.poll_max_interval_seconds,
-            burst_start_pct=settings.poll_burst_start_pct,
-            burst_interval_s=settings.poll_burst_interval_seconds,
         )
 
     def ramp_kwargs(self) -> dict:
         """The ``active_interval_for`` keyword arguments."""
         return {
-            "ramp_start_pct": self.ramp_start_pct,
+            "burn_pct_per_min": self.burn_pct_per_min,
+            "min_interval_s": self.min_interval_s,
             "far_interval_s": self.far_interval_s,
-            "burst_start_pct": self.burst_start_pct,
         }
 
 
@@ -229,28 +234,44 @@ def active_interval_for(
     pct: float | None,
     threshold: float,
     *,
-    ramp_start_pct: float = RAMP_START_PCT,
+    burn_pct_per_min: float = ASSUMED_BURN_PCT_PER_MIN,
+    min_interval_s: float = ACTIVE_MIN_INTERVAL_S,
     far_interval_s: float = ACTIVE_FAR_INTERVAL_S,
-    burst_start_pct: float = BURST_START_PCT,
 ) -> float:
-    """The active account's not-moving poll interval at ``pct`` used.
-
-    ``far_interval_s`` at or below the ramp start, ``MIN_INTERVAL_S`` at or
-    above the burst start (capped at the threshold: there is no burst zone
-    past the switch point), a straight line in between. Unknown utilization
-    takes ``MIN_INTERVAL_S`` — not knowing is no reason to wait long.
+    """The active account's poll interval at ``pct`` used, before the budget
+    guard: ``WAIT_SAFETY`` of the time a ``burn_pct_per_min`` burn would take
+    to cover the points left, clamped to ``[min_interval_s,
+    far_interval_s]``. At/over the threshold → the floor. Unknown
+    utilization takes ``MIN_INTERVAL_S`` — not knowing is no reason to wait
+    long, nor to poll fast.
     """
     if pct is None:
         return MIN_INTERVAL_S
-    far = max(far_interval_s, MIN_INTERVAL_S)
-    end = min(burst_start_pct, threshold)
-    start = min(ramp_start_pct, end)
-    if pct >= end:
-        return MIN_INTERVAL_S
-    if pct <= start:
-        return far
-    frac = (pct - start) / (end - start)
-    return far - frac * (far - MIN_INTERVAL_S)
+    floor = min(min_interval_s, far_interval_s)
+    points_left = threshold - pct
+    if points_left <= 0:
+        return floor
+    wait = WAIT_SAFETY * points_left / max(burn_pct_per_min, 0.01) * 60.0
+    return min(far_interval_s, max(floor, wait))
+
+
+def next_token_at(fetch_log: tuple[float, ...] | list[float]) -> float | None:
+    """When the request bucket next holds a whole token, given every request
+    in the trailing hour (including the one just made), or None when the log
+    is empty. Replays the log from a full bucket — the worst case for the
+    window, so the bound above holds for any trailing hour."""
+    tokens = float(FAST_POLL_BURST)
+    last: float | None = None
+    for t in sorted(fetch_log):
+        if last is not None:
+            tokens = min(float(FAST_POLL_BURST), tokens + (t - last) / MIN_INTERVAL_S)
+        tokens -= 1.0
+        last = t
+    if last is None:
+        return None
+    if tokens >= 1.0:
+        return last
+    return last + (1.0 - tokens) * MIN_INTERVAL_S
 
 
 def parse_reset_ts(resets_at: str | None) -> float | None:
@@ -275,22 +296,22 @@ def plan_after_fetch(
     recent_429: bool,
     now: float,
     rng: Callable[[], float] = random.random,
-    ramp_start_pct: float = RAMP_START_PCT,
+    burn_pct_per_min: float = ASSUMED_BURN_PCT_PER_MIN,
+    min_interval_s: float = ACTIVE_MIN_INTERVAL_S,
     far_interval_s: float = ACTIVE_FAR_INTERVAL_S,
-    burst_start_pct: float = BURST_START_PCT,
-    burst_interval_s: float = URGENT_INTERVAL_S,
+    fetch_log: tuple[float, ...] | None = None,
 ) -> tuple[float, float]:
     """``(next_poll_at, interval_s)`` for an account just fetched successfully.
 
-    The ACTIVE account's interval comes from room left
-    (:func:`active_interval_for`), dropping to ``burst_interval_s`` when it
-    is at/above the burst start and moved ≥ ``MOVEMENT_DELTA_PCT`` since the
-    previous poll. A CANDIDATE adapts on movement: movement halves the
-    interval (floored at ``MIN_INTERVAL_S``), no movement backs off ×1.5
-    toward ``max(CANDIDATE_MAX_INTERVAL_S, far_interval_s)``; unknown
-    utilization uses the default. A recent 429 on this token floors
-    the cadence at ``POST_429_MIN_INTERVAL_S`` (and suppresses urgent mode)
-    until ``RECENT_429_WINDOW_S`` has passed. The scheduled time gets
+    The ACTIVE account's interval is proportional to the points left
+    (:func:`active_interval_for`), and never sooner than the request bucket
+    allows (:func:`next_token_at` over ``fetch_log``, the trailing-hour
+    request times including this fetch). A
+    CANDIDATE adapts on movement: movement halves the interval (floored at
+    ``MIN_INTERVAL_S``), no movement backs off ×1.5 toward
+    ``max(CANDIDATE_MAX_INTERVAL_S, far_interval_s)``; unknown utilization
+    uses the default. A recent 429 on this token floors the cadence at
+    ``POST_429_MIN_INTERVAL_S`` until ``RECENT_429_WINDOW_S`` has passed. The scheduled time gets
     ``JITTER_FRAC`` noise, is never later than the account's next window
     reset (+ ``RESET_SLACK_S``). An at-limit account keeps a bounded slow
     poll instead of sleeping until that reset, so an early provider-side
@@ -307,29 +328,23 @@ def plan_after_fetch(
         and abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT
     )
     if is_active:
-        # Room left decides, not movement. The ramp ignores `base`, so a
-        # burst interval snaps straight back once movement stops.
+        # Points left decide, not movement or the previous interval.
         interval = active_interval_for(
             new_pct,
             threshold,
-            ramp_start_pct=ramp_start_pct,
+            burn_pct_per_min=burn_pct_per_min,
+            min_interval_s=min_interval_s,
             far_interval_s=far_interval_s,
-            burst_start_pct=burst_start_pct,
         )
+        ready = next_token_at(fetch_log) if fetch_log else None
+        if ready is not None:
+            interval = max(interval, ready - now)  # the hour's budget
     elif prev_pct is None or new_pct is None:
         interval = default
     elif moving:
         interval = max(MIN_INTERVAL_S, base / 2)
     else:
         interval = min(ceiling, max(MIN_INTERVAL_S, base * 1.5))
-    if (
-        is_active
-        and moving
-        and not recent_429
-        and new_pct is not None
-        and new_pct >= min(burst_start_pct, threshold)
-    ):
-        interval = burst_interval_s
     if recent_429:
         # AIMD additive-increase: grow the interval multiplicatively from the
         # last one toward the wider 429 ceiling, so machines sharing a

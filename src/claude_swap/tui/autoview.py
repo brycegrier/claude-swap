@@ -244,7 +244,7 @@ class AutoScreen(Screen):
         if interval is None:
             return "usage polls adapt to room left"
         if interval < poll_policy.MIN_INTERVAL_S:
-            text = f"usage polled every {interval:.0f}s (burst)"
+            text = f"usage polled every {interval:.0f}s (near the limit)"
         else:
             text = f"usage polled every ~{interval / 60:.0f}m"
         next_at = active.usage.next_poll_at

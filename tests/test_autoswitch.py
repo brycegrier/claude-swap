@@ -771,8 +771,8 @@ class TestAdaptiveScheduler:
         assert h.active_number() == 2
 
     def test_active_cadence_follows_room_left(self, temp_home, monkeypatch):
-        # The active account's wait comes from room left: 15 minutes at or
-        # below the ramp start, shortening linearly toward the burst start.
+        # The active account waits in proportion to the points left before
+        # the threshold (90 here): 10s per point at the default 3%/min.
         h = self._harness(temp_home, monkeypatch, accounts=2)
         usage = {"1": _usage(10), "2": _usage(20)}
         counts: dict[str, int] = {}
@@ -781,80 +781,76 @@ class TestAdaptiveScheduler:
         h.clock.advance(600)  # well past the old 3-5 minute cadence
         self._tick(h, counts, usage)
         assert counts["1"] == 1
-        h.clock.advance(300)  # t900: the 15-minute plan comes due
+        h.clock.advance(200)  # t800: 80 points left → 800s
         usage["1"] = _usage(70)
         self._tick(h, counts, usage)
         assert counts["1"] == 2
-        # 70% sits 4/5 of the way from the ramp start (50) to the burst
-        # start (75): the wait is 900 - 0.8 x (900 - 180) = 324s.
-        h.clock.advance(300)
+        h.clock.advance(150)  # 20 points left → 200s
         self._tick(h, counts, usage)
         assert counts["1"] == 2
-        h.clock.advance(24)
+        h.clock.advance(50)
         self._tick(h, counts, usage)
         assert counts["1"] == 3
 
-    def test_urgent_cadence_when_burning_near_the_band(self, temp_home, monkeypatch):
-        # Active moving inside the escalation band → 60s urgent cadence, so
-        # a threshold crossing is seen within a minute of the previous poll.
+    def test_wait_shrinks_as_room_runs_out(self, temp_home, monkeypatch):
+        # 70% → 200s, 80% → 100s, 88% → the 30s floor: a climb is polled
+        # faster the closer it gets to the threshold.
         h = self._harness(temp_home, monkeypatch, accounts=2)
         usage = {"1": _usage(70), "2": _usage(10)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
-        usage["1"] = _usage(80)  # burning: +10 pts, now inside the band
-        h.clock.advance(324)  # 70%'s ramp wait (see the room-left test)
-        self._tick(h, counts, usage)  # movement + in band → urgent plan
+        usage["1"] = _usage(80)
+        h.clock.advance(200)
+        self._tick(h, counts, usage)
         assert counts["1"] == 2
-        usage["1"] = _usage(84)
-        h.clock.advance(60)
-        self._tick(h, counts, usage)  # urgent plan due after only 60s
+        usage["1"] = _usage(88)
+        h.clock.advance(100)
+        self._tick(h, counts, usage)
         assert counts["1"] == 3
+        h.clock.advance(30)
+        self._tick(h, counts, usage)
+        assert counts["1"] == 4
 
-    def test_in_band_without_movement_keeps_the_floor(self, temp_home, monkeypatch):
-        # In the escalation band but not burning: no urgency — the normal
-        # 180s floor applies (escalation keeps candidates fresh; it must not
-        # re-fetch a fresh, unmoving active every tick).
+    def test_in_band_without_movement_follows_room_left(
+        self, temp_home, monkeypatch
+    ):
+        # In the escalation band but not moving: the wait still comes from
+        # the points left (80% → 100s), and escalation must not re-fetch a
+        # fresh active every tick before that.
         h = self._harness(temp_home, monkeypatch, accounts=2)
         usage = {"1": _usage(80), "2": _usage(10)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
-        for _ in range(2):
-            h.clock.advance(60)
-            self._tick(h, counts, usage)
-        assert counts["1"] == 1  # not due inside the floor
         h.clock.advance(60)
+        self._tick(h, counts, usage)
+        assert counts["1"] == 1  # not due yet
+        h.clock.advance(40)
         self._tick(h, counts, usage)
         assert counts["1"] == 2
 
-    def test_burst_zone_follows_the_burst_start_setting(
-        self, temp_home, monkeypatch
-    ):
-        # The burst zone starts at autoswitch.pollBurstStartPct (absolute
-        # pct), at the configured burst interval. At 60% with the default
-        # start (75) this movement would only ride the ramp.
+    def test_assumed_burn_setting_scales_the_wait(self, temp_home, monkeypatch):
+        # Planning for a 6%/min burn halves every wait: 70% → 100s, not 200s.
         h = self._harness(
-            temp_home, monkeypatch, accounts=2,
-            poll_burst_start_pct=60.0, poll_burst_interval_seconds=30.0,
+            temp_home, monkeypatch, accounts=2, poll_assumed_burn_pct_per_min=6.0,
         )
-        usage = {"1": _usage(61), "2": _usage(10)}
+        usage = {"1": _usage(70), "2": _usage(10)}
         counts: dict[str, int] = {}
-        self._tick(h, counts, usage)  # in the zone, not moving yet → 180s
-        usage["1"] = _usage(65)
-        h.clock.advance(180)
-        self._tick(h, counts, usage)  # movement in the zone → burst plan
+        self._tick(h, counts, usage)
+        h.clock.advance(90)
+        self._tick(h, counts, usage)
+        assert counts["1"] == 1
+        h.clock.advance(10)
+        self._tick(h, counts, usage)
         assert counts["1"] == 2
-        usage["1"] = _usage(67)
-        h.clock.advance(30)
-        self._tick(h, counts, usage)  # burst plan due after 30s
-        assert counts["1"] == 3
 
     def test_stale_candidate_plan_never_gates_the_active(
         self, temp_home, monkeypatch
     ):
         # Role change outside a cswap switch (e.g. manual login): the active
         # slot can carry a plan written while it was an idle candidate (or a
-        # widened post-429 one). The age cap is the active ramp's own wait at
-        # the row's utilization — 60% → 612s — so a slower plan is overridden.
+        # widened post-429 one). The age cap is the active cadence's own wait
+        # at the row's utilization — 60% → 300s — so a slower plan is
+        # overridden.
         h = self._harness(temp_home, monkeypatch, accounts=2)
         usage = {"1": _usage(60), "2": _usage(20)}
         counts: dict[str, int] = {}
@@ -862,25 +858,26 @@ class TestAdaptiveScheduler:
         h.switcher._usage_store.set_poll_plan(
             {"1": (h.clock.now + 1200.0, 1200.0)}, {"1": ("a@example.com", "")}
         )
-        h.clock.advance(400)  # inside the bogus plan, under the age cap
+        h.clock.advance(200)  # inside the bogus plan, under the age cap
         self._tick(h, counts, usage)
         assert counts["1"] == 1
-        h.clock.advance(240)  # age 640 ≥ the 612s ramp cap
+        h.clock.advance(120)  # age 320 ≥ the 300s cap
         self._tick(h, counts, usage)
         assert counts["1"] == 2
 
     def test_a_long_ramp_plan_is_not_forced_early(self, temp_home, monkeypatch):
-        # The old fixed 300s age cap would have refetched a 15-minute plan at
-        # 5 minutes, undoing the ramp. At 30% used the cap is the 15 minutes.
+        # The old fixed 300s age cap would have refetched a long plan at 5
+        # minutes, undoing it. At 20% used (70 points left) the plan and the
+        # cap are both 700s.
         h = self._harness(temp_home, monkeypatch, accounts=1)
-        usage = {"1": _usage(30)}
+        usage = {"1": _usage(20)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
-        for _ in range(4):
-            h.clock.advance(200)  # ages 200..800s
+        for _ in range(3):
+            h.clock.advance(200)  # ages 200..600s
             self._tick(h, counts, usage)
         assert counts["1"] == 1
-        h.clock.advance(100)  # age 900
+        h.clock.advance(100)  # age 700
         self._tick(h, counts, usage)
         assert counts["1"] == 2
 
@@ -939,23 +936,23 @@ class TestAdaptiveScheduler:
         # Active at 40% jumps into the band between polls: the jump is picked
         # up on the next planned poll, escalates the same tick, and the
         # movement flips the active onto the urgent cadence.
-        # With lots of room left the plan is the 15-minute wait — the cost
-        # the ramp accepts — so the jump is seen at that planned poll.
+        # 40% at threshold 90 plans 500s, so a jump between polls is seen
+        # at that planned poll; the shorter wait at 80% (100s) follows.
         h = self._harness(temp_home, monkeypatch, accounts=2)
         usage = {"1": _usage(40), "2": _usage(20)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
         usage["1"] = _usage(80)
-        h.clock.advance(600)
+        h.clock.advance(300)
         self._tick(h, counts, usage)  # plan-skipped: still believed at 40%
         assert counts["1"] == 1
         candidate_before = counts["2"]
-        h.clock.advance(300)
+        h.clock.advance(200)
         self._tick(h, counts, usage)  # planned poll sees 80% → escalate-all
         assert counts["1"] == 2
         assert counts["2"] == candidate_before + 1  # escalation refreshed it
-        h.clock.advance(60)
-        self._tick(h, counts, usage)  # movement in band → urgent cadence
+        h.clock.advance(100)
+        self._tick(h, counts, usage)  # 10 points left → 100s
         assert counts["1"] == 3
         assert counts["2"] == candidate_before + 1  # fresh: served, not refetched
 
@@ -1655,11 +1652,11 @@ class TestAdaptiveScheduler:
         phase-2 escalation is reserved for ticks that would actually switch.
         The fetch-set spy also catches an accidental all-candidates request
         that reserve() would have served from the store without HTTP."""
-        # Pin the active cadence at the 180s floor (ramp start 0, max 180):
+        # Pin the active cadence at 180s (min = max = 180):
         # this test is about which sets get fetched, not the ramp.
         h = self._harness(
             temp_home, monkeypatch, strategy="consume-first",
-            poll_ramp_start_pct=0.0, poll_max_interval_seconds=180.0,
+            poll_min_interval_seconds=180.0, poll_max_interval_seconds=180.0,
         )
         # Active resets soonest -> every tick holds already-consuming-soonest.
         # five_hour 50 mirrors the baseline-cadence test's active plan.
@@ -1699,7 +1696,7 @@ class TestAdaptiveScheduler:
         # sees view_b; the scenario is about the freshness gate.
         h = self._harness(
             temp_home, monkeypatch, strategy="consume-first",
-            poll_ramp_start_pct=0.0, poll_max_interval_seconds=180.0,
+            poll_min_interval_seconds=180.0, poll_max_interval_seconds=180.0,
         )
         counts: dict[str, int] = {}
         # Populate the store while the active account resets soonest (holds).
@@ -2778,9 +2775,9 @@ class TestModelAwareSwitch:
         assert exhausted.earliest_reset_at == fable_reset
 
     def test_scoped_binding_window_keeps_active_cadence_tight(self, temp_home):
-        # Fable moving at 88% is inside the escalation band: with the model
-        # configured the urgent cadence engages, while the 5%-used 5h window
-        # alone would just decay the interval.
+        # Fable at 88% is 2 points from the threshold: with the model
+        # configured the cadence drops to the floor, while the 5%-used 5h
+        # window alone would wait about 14 minutes.
         kwargs = dict(
             prev_interval_s=poll_policy.MIN_INTERVAL_S,
             prev_usage=_model_usage(5, 84),
@@ -2792,9 +2789,9 @@ class TestModelAwareSwitch:
             rng=lambda: 0.5,
         )
         _, scoped = poll_policy.plan_after_fetch(models=("Fable",), **kwargs)
-        assert scoped == poll_policy.URGENT_INTERVAL_S
+        assert scoped == poll_policy.ACTIVE_MIN_INTERVAL_S
         _, unscoped = poll_policy.plan_after_fetch(models=(), **kwargs)
-        assert unscoped > poll_policy.MIN_INTERVAL_S  # plain decay
+        assert unscoped == poll_policy.active_interval_for(5.0, 90.0)
 
     def test_unmatched_model_name_warns_once(self, temp_home):
         h = self._seed(temp_home, model="Fabel")  # deliberate typo
