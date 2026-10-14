@@ -1845,3 +1845,41 @@ class TestAdopt:
         store.adopt({"2": (USAGE, 0.0)}, IDENT)
         row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["2"]
         assert (row["email"], row["organizationUuid"]) == IDENT["2"]
+
+
+class TestFetchLog:
+    """Per-row request accounting for rate-limit tuning (req/h)."""
+
+    def test_counts_successes_and_429s_in_the_trailing_hour(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(600)
+        store.record({"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT)
+        clock.advance(600)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.requests_last_hour(clock.now) == 3
+        assert len(entry.fetch_log) == 3
+
+    def test_requests_age_out_after_an_hour(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(3000)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(700)  # the first request is now 3700s old
+        entry = store.entries(IDENT)["1"]
+        assert entry.requests_last_hour(clock.now) == 1
+        assert len(entry.fetch_log) == 1  # pruned at read time
+
+    def test_pre_request_failures_and_sentinels_are_not_requests(self, store, clock):
+        from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+
+        store.record({"1": FetchRecord(error="no-access-token")}, IDENT)
+        store.record({"1": FetchRecord(error="refresh-failed")}, IDENT)
+        store.record({"1": FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)}, IDENT)
+        assert store.entries(IDENT)["1"].requests_last_hour(clock.now) == 0
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        assert store.entries(IDENT)["1"].requests_last_hour(clock.now) == 1
+
+    def test_survives_a_reload(self, store, clock, tmp_path):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        reloaded = UsageStore(tmp_path / "cache", clock=clock)
+        assert reloaded.entries(IDENT)["1"].requests_last_hour(clock.now) == 1

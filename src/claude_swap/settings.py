@@ -36,15 +36,23 @@ class AutoSwitchSettings:
     ``threshold`` is binding-window utilization (max of the 5h/7d percentages):
     at or above it the engine looks for a better account. 90 rather than 95
     leaves margin for the macOS ~30s Keychain pickup tail and for heavy
-    subagent turns burning past the mark before a swap lands. A proactive
-    candidate must itself sit below the threshold (never land somewhere that
-    re-triggers next tick) and beat the active account's utilization by at
-    least ``hysteresis_pct``, so two accounts hovering at the line never
-    ping-pong while a strictly better account is always taken.
+    subagent turns burning past the mark before a swap lands. Thresholds in
+    the high 90s rely on the burst cadence (``poll_burst_*``): from the burst
+    start, every observed rise is re-polled within ``poll_burst_interval_s``,
+    so the overshoot past the mark is about one burst interval of usage. A
+    proactive candidate must itself sit below the threshold (never land
+    somewhere that re-triggers next tick) and beat the active account's
+    utilization by at least ``hysteresis_pct``, so two accounts hovering at
+    the line never ping-pong while a strictly better account is always taken.
+
+    ``interval_seconds`` is NOT the usage poll rate (that is the
+    ``poll_*`` ramp, see ``poll_policy``): the engine sleeps until the next
+    poll is due, and this caps that sleep so local changes (a manual account
+    switch) are still noticed.
     """
 
     threshold: float = 90.0
-    interval_seconds: float = 60.0
+    interval_seconds: float = 300.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
     # "best" (most headroom), "consume-first" (soonest weekly reset), or
@@ -63,6 +71,14 @@ class AutoSwitchSettings:
     # dry-run. TUI-only: `cswap auto` is always live unless --dry-run, so the
     # CLI ignores this. The default keeps "opening a view never switches".
     tui_starts_live: bool = False
+    # Usage poll ramp for the active account (see poll_policy): wait
+    # poll_max_interval_seconds at or below poll_ramp_start_pct used, shorten
+    # linearly to 3 min at poll_burst_start_pct, and poll every
+    # poll_burst_interval_seconds from there while usage keeps rising.
+    poll_ramp_start_pct: float = 50.0
+    poll_max_interval_seconds: float = 900.0
+    poll_burst_start_pct: float = 75.0
+    poll_burst_interval_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -114,7 +130,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
-            help="Poll interval for the cswap auto loop, in seconds",
+            help="Longest wait between local checks when no usage poll is due",
         ),
         SettingSpec(
             "autoswitch", "cooldownSeconds", "cooldown_seconds", "float", 0.0, 86400.0,
@@ -144,6 +160,24 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "tuiStartsLive", "tui_starts_live", "bool",
             help="Start the TUI auto-switch view live instead of in dry-run",
+        ),
+        SettingSpec(
+            "autoswitch", "pollRampStartPct", "poll_ramp_start_pct", "float", 0.0, 99.0,
+            help="Below this pct used, poll usage at the max interval",
+        ),
+        SettingSpec(
+            "autoswitch", "pollMaxIntervalSeconds", "poll_max_interval_seconds",
+            "float", 180.0, 3600.0,
+            help="Longest wait between usage polls (lots of room left)",
+        ),
+        SettingSpec(
+            "autoswitch", "pollBurstStartPct", "poll_burst_start_pct", "float", 0.0, 99.9,
+            help="From this pct used, poll fast while usage keeps rising",
+        ),
+        SettingSpec(
+            "autoswitch", "pollBurstIntervalSeconds", "poll_burst_interval_seconds",
+            "float", 20.0, 180.0,
+            help="Wait between usage polls during a burst",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

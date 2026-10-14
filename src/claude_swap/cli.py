@@ -628,7 +628,10 @@ Defaults live in settings.json in the backup root; flags override them.
         "--interval",
         type=float,
         metavar="SECONDS",
-        help="Poll interval in loop mode (min 15; default 60)",
+        help=(
+            "Longest wait between local checks in loop mode (min 15; default "
+            "300). Usage polling itself adapts — see autoswitch.poll* settings"
+        ),
     )
     parser.add_argument(
         "--threshold",
@@ -687,7 +690,7 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     args = parser.parse_args(argv)
 
-    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import load_settings, merged_with_cli
 
@@ -699,7 +702,9 @@ Defaults live in settings.json in the backup root; flags override them.
         line = event.human()
         if event.kind == "switch":
             line = accent(line)
-        elif event.kind in ("error", "account-quarantined"):
+        elif event.kind in ("error", "account-quarantined") or getattr(
+            event, "rate_limited", None
+        ):
             line = yellowed(line)
         elif event.kind in ("poll", "no-switch", "sleep"):
             line = dimmed(line)
@@ -728,8 +733,12 @@ Defaults live in settings.json in the backup root; flags override them.
         if not args.json:
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
-                    f"every {settings.interval_seconds:.0f}s"
+                    f"Auto-switch running: threshold "
+                    f"{pct_label(settings.threshold)}%, usage polls every "
+                    f"{settings.poll_max_interval_seconds / 60:.0f}m below "
+                    f"{pct_label(settings.poll_ramp_start_pct)}% used, "
+                    f"{settings.poll_burst_interval_seconds:.0f}s bursts from "
+                    f"{pct_label(settings.poll_burst_start_pct)}%"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )

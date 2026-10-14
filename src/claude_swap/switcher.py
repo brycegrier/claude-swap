@@ -330,9 +330,9 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
-        # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
-        self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
-        self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
+        # (settings mtime, PollInputs) — see _poll_policy_inputs.
+        self._poll_inputs_cache: tuple[float | None, poll_policy.PollInputs] | None = None
+        self._poll_inputs_override: poll_policy.PollInputs | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -1789,13 +1789,11 @@ class ClaudeAccountSwitcher:
             for num, entry in self._usage_store.entries(identities).items()
         }
 
-    def set_poll_policy_inputs(
-        self, threshold: float, models: tuple[str, ...]
-    ) -> None:
-        """Pin the threshold/models poll planning keys on (set by a hosted
-        auto engine so cadence follows its effective, CLI-merged settings
-        instead of the settings file)."""
-        self._poll_inputs_override = (threshold, models)
+    def set_poll_policy_inputs(self, inputs: poll_policy.PollInputs) -> None:
+        """Pin what poll planning keys on (set by a hosted auto engine so
+        cadence follows its effective, CLI-merged settings instead of the
+        settings file)."""
+        self._poll_inputs_override = inputs
 
     def clear_poll_policy_inputs(self) -> None:
         """Drop the hosted engine's pin so poll planning falls back to the
@@ -1804,10 +1802,10 @@ class ClaudeAccountSwitcher:
         engine it belonged to is gone."""
         self._poll_inputs_override = None
 
-    def _poll_policy_inputs(self) -> tuple[float, tuple[str, ...]]:
-        """Threshold + configured model names for poll planning: the hosting
-        engine's pinned values when present, else the settings file (reloaded
-        only when it changes — one stat per pass)."""
+    def _poll_policy_inputs(self) -> poll_policy.PollInputs:
+        """Poll-planning inputs: the hosting engine's pinned values when
+        present, else the settings file (reloaded only when it changes — one
+        stat per pass)."""
         if self._poll_inputs_override is not None:
             return self._poll_inputs_override
         path = settings_path(self.backup_dir)
@@ -1818,7 +1816,9 @@ class ClaudeAccountSwitcher:
         if self._poll_inputs_cache is not None and self._poll_inputs_cache[0] == mtime:
             return self._poll_inputs_cache[1]
         loaded = load_settings(self.backup_dir)
-        inputs = (loaded.threshold, parse_model_names(loaded.model))
+        inputs = poll_policy.PollInputs.from_settings(
+            loaded, parse_model_names(loaded.model)
+        )
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
 
@@ -4977,7 +4977,7 @@ class ClaudeAccountSwitcher:
         info_by_num = {str(info[0]): info for info in accounts_info}
         # Scoped-window models so the 429-stale trust bound honors per-model
         # (e.g. Fable) resets, matching the poll planner's window view.
-        _threshold, models = self._poll_policy_inputs()
+        models = self._poll_policy_inputs().models
         sentinels: dict[str, str] = {}
         for num, info in info_by_num.items():
             static = self._static_usage_sentinel(info)
@@ -5200,7 +5200,7 @@ class ClaudeAccountSwitcher:
         for when the backoff lifts.
         """
         now = self._usage_store.clock()
-        threshold, models = self._poll_policy_inputs()
+        inputs = self._poll_policy_inputs()
         plans: dict[str, tuple[float | None, float | None]] = {}
         for num, rec in records.items():
             if rec.sentinel is not None or rec.error is not None:
@@ -5212,10 +5212,12 @@ class ClaudeAccountSwitcher:
                 prev_usage=before.last_good if before else None,
                 new_usage=rec.usage,
                 is_active=bool(info_by_num[num][4]),
-                threshold=threshold,
-                models=models,
+                threshold=inputs.threshold,
+                models=inputs.models,
                 recent_429=recent_429,
                 now=now,
+                burst_interval_s=inputs.burst_interval_s,
+                **inputs.ramp_kwargs(),
             )
         return plans
 

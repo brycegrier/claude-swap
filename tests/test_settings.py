@@ -98,6 +98,26 @@ class TestLoadSettings:
         set_setting(tmp_path, "autoswitch.strategy", "consume-first")
         assert load_settings(tmp_path).strategy == "consume-first"
 
+    def test_poll_ramp_keys_round_trip_and_clamp(self, tmp_path: Path):
+        defaults = load_settings(tmp_path)
+        assert defaults.interval_seconds == 300.0  # now a cap, not the cadence
+        assert (
+            defaults.poll_ramp_start_pct,
+            defaults.poll_max_interval_seconds,
+            defaults.poll_burst_start_pct,
+            defaults.poll_burst_interval_seconds,
+        ) == (50.0, 900.0, 75.0, 60.0)
+        set_setting(tmp_path, "autoswitch.pollBurstStartPct", "90")
+        set_setting(tmp_path, "autoswitch.pollBurstIntervalSeconds", "30")
+        loaded = load_settings(tmp_path)
+        assert loaded.poll_burst_start_pct == 90.0
+        assert loaded.poll_burst_interval_seconds == 30.0
+        # A hand-edited burst below the 20s floor is clamped on load.
+        settings_path(tmp_path).write_text(json.dumps(
+            {"autoswitch": {"pollBurstIntervalSeconds": 5}}
+        ))
+        assert load_settings(tmp_path).poll_burst_interval_seconds == 20.0
+
     def test_tui_starts_live_defaults_off_and_round_trips(self, tmp_path: Path):
         assert load_settings(tmp_path).tui_starts_live is False
         set_setting(tmp_path, "autoswitch.tuiStartsLive", "true")

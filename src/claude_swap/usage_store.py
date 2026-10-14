@@ -269,6 +269,37 @@ class FetchRecord:
     rejected_fp: str | None = None
 
 
+# Request accounting for rate-limit tuning: every attempt that actually hit
+# the usage endpoint (success or an HTTP/transport failure — not pre-request
+# refusals like a missing token) is timestamped on its row, pruned to the
+# trailing hour the endpoint's budget is measured over.
+FETCH_LOG_WINDOW_S = 3600.0
+_PRE_REQUEST_ERRORS = frozenset({
+    "no-access-token", "refresh-failed", "store-unmirrored",
+    "invalid_grant", "no_refresh_token",
+})
+
+
+def _hit_the_endpoint(rec: "FetchRecord") -> bool:
+    if rec.sentinel is not None:
+        return False
+    return rec.error is None or (
+        rec.error not in _PRE_REQUEST_ERRORS
+        and (rec.error.startswith("http-")
+             or rec.error in ("timeout", "network", "bad-response"))
+    )
+
+
+def _pruned_fetch_log(raw, now: float) -> list[float]:
+    if not isinstance(raw, list):
+        return []
+    return [
+        float(t) for t in raw
+        if isinstance(t, (int, float)) and not isinstance(t, bool)
+        and now - FETCH_LOG_WINDOW_S < t <= now
+    ]
+
+
 @dataclass(frozen=True)
 class UsageEntry:
     """Read model of one account's usage state at collect time.
@@ -314,6 +345,13 @@ class UsageEntry:
     # import-usage``) keeps every collector off this slot. Appended for the
     # same positional compatibility as ``claim_until``.
     held_until: float | None = None
+    # Timestamps of endpoint requests in the trailing hour (any surface on
+    # this machine). Appended, like the two above.
+    fetch_log: tuple[float, ...] = ()
+
+    def requests_last_hour(self, now: float) -> int:
+        """Usage-endpoint requests for this account in the trailing hour."""
+        return sum(1 for t in self.fetch_log if now - FETCH_LOG_WINDOW_S < t <= now)
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -434,6 +472,35 @@ def plan_oversleeps_interval(entry: UsageEntry, now: float) -> bool:
         entry.poll_interval_s,
         now,
     )
+
+
+def due_at(
+    entry: UsageEntry | None, now: float, *, no_plan_wait_s: float = 0.0
+) -> float | None:
+    """When a collector would next fetch this row, or None for never.
+
+    The same rules as :func:`due_candidate` (sentinels and dead tokens are
+    never fetched, backoff and adopted-reading holds defer, an obsolete
+    reset-parked plan is due now), expressed as a time so the auto engine
+    can sleep until something is actually due instead of re-reading the
+    store on a fixed cadence. ``no_plan_wait_s`` is how long after its last
+    fetch a plan-less row comes due (the active slot waits the normal floor;
+    a candidate is due at once).
+    """
+    if entry is None:
+        return now
+    if entry.sentinel is not None or entry.token_dead():
+        return None
+    gates = [
+        t for t in (entry.backoff_until, entry.held_until) if t is not None and t > now
+    ]
+    if entry.next_poll_at is not None and not plan_oversleeps_interval(entry, now):
+        due = entry.next_poll_at
+    elif entry.fetched_at is None:
+        due = now
+    else:
+        due = entry.fetched_at + no_plan_wait_s
+    return max([due, *gates])
 
 
 def due_candidate(
@@ -966,6 +1033,7 @@ class UsageStore:
                 trust_extended=trust_extended,
                 claim_until=claim_until,
                 held_until=held_until,
+                fetch_log=tuple(_pruned_fetch_log(row.get("fetchLog"), now)),
             )
         return out
 
@@ -1100,6 +1168,10 @@ class UsageStore:
                     row["rejectedFingerprint"] = rec.rejected_fp
                 return
             row["lastAttemptAt"] = now
+            if _hit_the_endpoint(rec):
+                log = _pruned_fetch_log(row.get("fetchLog"), now)
+                log.append(now)
+                row["fetchLog"] = log
             if rec.error is None:
                 row["lastGood"] = rec.usage
                 row["fetchedAt"] = now

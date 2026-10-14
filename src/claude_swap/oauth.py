@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import sys
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -394,6 +396,57 @@ def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
     return None
 
 
+# Rate-limit visibility. The usage endpoint documents no budget headers, so
+# capture any whose NAME looks rate-limit related (success or error response)
+# rather than guessing names. The fetch path stashes them per account in this
+# process so the auto engine's ticker can print them; the first response in a
+# process also logs every header name at DEBUG, which is how to find out
+# whether anything useful is sent at all.
+_RATE_HEADER_RE = re.compile(r"ratelimit|rate-limit|retry-after", re.IGNORECASE)
+_rate_tls = threading.local()
+_rate_headers_by_account: dict[str, dict[str, str]] = {}
+_rate_headers_lock = threading.Lock()
+_header_names_logged = False
+
+
+def _capture_rate_headers(headers) -> None:
+    """Remember this thread's last response's rate-limit-like headers."""
+    global _header_names_logged
+    if headers is None:
+        _rate_tls.headers = {}
+        return
+    try:
+        items = list(headers.items())
+    except Exception:
+        items = []
+    if not _header_names_logged:
+        _header_names_logged = True
+        logging.getLogger("claude-swap").debug(
+            "usage endpoint response header names: %s",
+            ", ".join(sorted({k.lower() for k, _ in items})) or "(none)",
+        )
+    _rate_tls.headers = {
+        k.lower(): v for k, v in items if _RATE_HEADER_RE.search(k)
+    }
+
+
+def _take_rate_headers(account_num: str) -> None:
+    """Move this thread's captured headers to ``account_num``'s slot."""
+    captured = getattr(_rate_tls, "headers", None)
+    _rate_tls.headers = None
+    if captured is None:
+        return
+    with _rate_headers_lock:
+        _rate_headers_by_account[account_num] = captured
+
+
+def rate_headers_for(account_num: str) -> dict[str, str]:
+    """Rate-limit-like headers from the last response for this account seen
+    by this process (empty when none were sent, or nothing was fetched)."""
+    with _rate_headers_lock:
+        return dict(_rate_headers_by_account.get(account_num, {}))
+
+
 def request_usage_data(access_token: str) -> dict:
     """Request raw utilization data from the Anthropic usage API."""
     url = "https://api.anthropic.com/api/oauth/usage"
@@ -403,8 +456,13 @@ def request_usage_data(access_token: str) -> dict:
         "User-Agent": "claude-swap/1.0",
     }
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            _capture_rate_headers(resp.headers)
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        _capture_rate_headers(e.headers)
+        raise
 
 
 def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
@@ -703,7 +761,10 @@ def try_fetch_usage_for_account(
         # the 401 path below retries the refresh.
 
     try:
-        data = request_usage_data(access_token)
+        try:
+            data = request_usage_data(access_token)
+        finally:
+            _take_rate_headers(account_num)
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
@@ -752,7 +813,10 @@ def try_fetch_usage_for_account(
             return UsageOutcome(None, error="refresh-failed")
 
         try:
-            data = request_usage_data(new_token)
+            try:
+                data = request_usage_data(new_token)
+            finally:
+                _take_rate_headers(account_num)
             return UsageOutcome(build_usage_result(data))
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)

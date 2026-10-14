@@ -14,6 +14,7 @@ import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import oauth
+from claude_swap import poll_policy
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
     AccountNotFoundError,
@@ -4283,7 +4284,7 @@ class TestDeadTokenQuarantine:
 
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
-        switcher._poll_inputs_override = (90.0, ("Fable",))
+        switcher._poll_inputs_override = poll_policy.PollInputs(90.0, ("Fable",))
         store = switcher._usage_store
         now = time.time()
 

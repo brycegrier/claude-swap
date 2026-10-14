@@ -1522,3 +1522,30 @@ class TestLoginExpiresAtIso:
     ])
     def test_anything_but_a_positive_epoch_is_unknown(self, creds):
         assert oauth.login_expires_at_iso(creds) is None
+
+
+class TestRateHeaderCapture:
+    """Only rate-limit-like headers are kept, per account, for the ticker."""
+
+    def test_keeps_only_rate_limit_like_names(self):
+        from email.message import Message
+
+        headers = Message()
+        headers["Content-Type"] = "application/json"
+        headers["RateLimit-Remaining"] = "12"
+        headers["X-RateLimit-Limit"] = "30"
+        headers["Retry-After"] = "0"
+        headers["CF-Ray"] = "abc"
+        oauth._capture_rate_headers(headers)
+        oauth._take_rate_headers("7")
+        assert oauth.rate_headers_for("7") == {
+            "ratelimit-remaining": "12",
+            "x-ratelimit-limit": "30",
+            "retry-after": "0",
+        }
+
+    def test_nothing_captured_leaves_the_last_reading(self):
+        oauth._capture_rate_headers(None)
+        oauth._take_rate_headers("8")
+        assert oauth.rate_headers_for("8") == {}
+        assert oauth.rate_headers_for("never-fetched") == {}

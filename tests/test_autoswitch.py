@@ -6,12 +6,13 @@ import json
 import os
 import threading
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from claude_swap import oauth, poll_policy
+from claude_swap import autoswitch, oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
@@ -24,6 +25,7 @@ from claude_swap.autoswitch import (
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
+    SleepEvent,
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
@@ -735,10 +737,15 @@ class TestAdaptiveScheduler:
         h.clock.advance(60)
         self._tick(h, counts, usage)
         assert counts == {"1": 1, "2": 1, "3": 1}
-        # t180: the active account's plan comes due.
-        h.clock.advance(60)
+        # t300: candidate #2's default plan comes due; the active account,
+        # at 50% used (the ramp start), is still on its 15-minute wait.
+        h.clock.advance(180)
         self._tick(h, counts, usage)
-        assert counts == {"1": 2, "2": 1, "3": 1}
+        assert counts == {"1": 1, "2": 2, "3": 1}
+        # t900: the active account's plan comes due.
+        h.clock.advance(600)
+        self._tick(h, counts, usage)
+        assert counts["1"] == 2
 
     def test_near_threshold_escalates_to_full_refresh(self, temp_home, monkeypatch):
         # threshold 90, margin 15 → active at 80% is within the escalation band.
@@ -763,26 +770,27 @@ class TestAdaptiveScheduler:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
-    def test_active_cadence_floor_and_decay(self, temp_home, monkeypatch):
-        # The active account polls at MIN_INTERVAL_S first; unmoved usage
-        # decays the interval ×1.5 toward ACTIVE_MAX_INTERVAL_S.
+    def test_active_cadence_follows_room_left(self, temp_home, monkeypatch):
+        # The active account's wait comes from room left: 15 minutes at or
+        # below the ramp start, shortening linearly toward the burst start.
         h = self._harness(temp_home, monkeypatch, accounts=2)
         usage = {"1": _usage(10), "2": _usage(20)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)  # never-fetched → fetched
         assert counts["1"] == 1
-        for _ in range(2):  # ages 60s and 120s — inside the 180s floor
-            h.clock.advance(60)
-            self._tick(h, counts, usage)
+        h.clock.advance(600)  # well past the old 3-5 minute cadence
+        self._tick(h, counts, usage)
         assert counts["1"] == 1
-        h.clock.advance(60)  # age 180s → due again
+        h.clock.advance(300)  # t900: the 15-minute plan comes due
+        usage["1"] = _usage(70)
         self._tick(h, counts, usage)
         assert counts["1"] == 2
-        # Unmoved → interval decayed to 270s: not due at +240, due at +300.
-        h.clock.advance(240)
+        # 70% sits 4/5 of the way from the ramp start (50) to the burst
+        # start (75): the wait is 900 - 0.8 x (900 - 180) = 324s.
+        h.clock.advance(300)
         self._tick(h, counts, usage)
         assert counts["1"] == 2
-        h.clock.advance(60)
+        h.clock.advance(24)
         self._tick(h, counts, usage)
         assert counts["1"] == 3
 
@@ -794,7 +802,7 @@ class TestAdaptiveScheduler:
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
         usage["1"] = _usage(80)  # burning: +10 pts, now inside the band
-        h.clock.advance(180)
+        h.clock.advance(324)  # 70%'s ramp wait (see the room-left test)
         self._tick(h, counts, usage)  # movement + in band → urgent plan
         assert counts["1"] == 2
         usage["1"] = _usage(84)
@@ -818,40 +826,61 @@ class TestAdaptiveScheduler:
         self._tick(h, counts, usage)
         assert counts["1"] == 2
 
-    def test_urgent_band_follows_the_threshold(self, temp_home, monkeypatch):
-        # The urgent band is distance-to-threshold, not absolute pct: with
-        # threshold 50 (band edge 35), movement at 40% engages the urgent
-        # cadence that the default threshold would ignore.
-        h = self._harness(temp_home, monkeypatch, accounts=2, threshold=50)
-        usage = {"1": _usage(30), "2": _usage(10)}
+    def test_burst_zone_follows_the_burst_start_setting(
+        self, temp_home, monkeypatch
+    ):
+        # The burst zone starts at autoswitch.pollBurstStartPct (absolute
+        # pct), at the configured burst interval. At 60% with the default
+        # start (75) this movement would only ride the ramp.
+        h = self._harness(
+            temp_home, monkeypatch, accounts=2,
+            poll_burst_start_pct=60.0, poll_burst_interval_seconds=30.0,
+        )
+        usage = {"1": _usage(61), "2": _usage(10)}
         counts: dict[str, int] = {}
-        self._tick(h, counts, usage)
-        usage["1"] = _usage(40)
+        self._tick(h, counts, usage)  # in the zone, not moving yet → 180s
+        usage["1"] = _usage(65)
         h.clock.advance(180)
-        self._tick(h, counts, usage)  # movement inside the 35..50 band
+        self._tick(h, counts, usage)  # movement in the zone → burst plan
         assert counts["1"] == 2
-        usage["1"] = _usage(44)
-        h.clock.advance(60)
-        self._tick(h, counts, usage)  # urgent plan due after only 60s
+        usage["1"] = _usage(67)
+        h.clock.advance(30)
+        self._tick(h, counts, usage)  # burst plan due after 30s
         assert counts["1"] == 3
 
     def test_stale_candidate_plan_never_gates_the_active(
         self, temp_home, monkeypatch
     ):
         # Role change outside a cswap switch (e.g. manual login): the active
-        # slot can carry a plan written while it was an idle candidate, up to
-        # 600s out. The ACTIVE_MAX_INTERVAL_S age cap overrides it.
+        # slot can carry a plan written while it was an idle candidate (or a
+        # widened post-429 one). The age cap is the active ramp's own wait at
+        # the row's utilization — 60% → 612s — so a slower plan is overridden.
         h = self._harness(temp_home, monkeypatch, accounts=2)
-        usage = {"1": _usage(50), "2": _usage(20)}
+        usage = {"1": _usage(60), "2": _usage(20)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
         h.switcher._usage_store.set_poll_plan(
-            {"1": (h.clock.now + 600.0, 600.0)}, {"1": ("a@example.com", "")}
+            {"1": (h.clock.now + 1200.0, 1200.0)}, {"1": ("a@example.com", "")}
         )
-        h.clock.advance(240)  # inside the bogus plan, under the age cap
+        h.clock.advance(400)  # inside the bogus plan, under the age cap
         self._tick(h, counts, usage)
         assert counts["1"] == 1
-        h.clock.advance(120)  # age 360 ≥ ACTIVE_MAX_INTERVAL_S
+        h.clock.advance(240)  # age 640 ≥ the 612s ramp cap
+        self._tick(h, counts, usage)
+        assert counts["1"] == 2
+
+    def test_a_long_ramp_plan_is_not_forced_early(self, temp_home, monkeypatch):
+        # The old fixed 300s age cap would have refetched a 15-minute plan at
+        # 5 minutes, undoing the ramp. At 30% used the cap is the 15 minutes.
+        h = self._harness(temp_home, monkeypatch, accounts=1)
+        usage = {"1": _usage(30)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        for _ in range(4):
+            h.clock.advance(200)  # ages 200..800s
+            self._tick(h, counts, usage)
+        assert counts["1"] == 1
+        h.clock.advance(100)  # age 900
         self._tick(h, counts, usage)
         assert counts["1"] == 2
 
@@ -910,22 +939,25 @@ class TestAdaptiveScheduler:
         # Active at 40% jumps into the band between polls: the jump is picked
         # up on the next planned poll, escalates the same tick, and the
         # movement flips the active onto the urgent cadence.
+        # With lots of room left the plan is the 15-minute wait — the cost
+        # the ramp accepts — so the jump is seen at that planned poll.
         h = self._harness(temp_home, monkeypatch, accounts=2)
         usage = {"1": _usage(40), "2": _usage(20)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
         usage["1"] = _usage(80)
-        h.clock.advance(60)
+        h.clock.advance(600)
         self._tick(h, counts, usage)  # plan-skipped: still believed at 40%
         assert counts["1"] == 1
-        h.clock.advance(120)
+        candidate_before = counts["2"]
+        h.clock.advance(300)
         self._tick(h, counts, usage)  # planned poll sees 80% → escalate-all
         assert counts["1"] == 2
-        assert counts["2"] == 1  # at the TTL edge: still served, not refetched
+        assert counts["2"] == candidate_before + 1  # escalation refreshed it
         h.clock.advance(60)
         self._tick(h, counts, usage)  # movement in band → urgent cadence
         assert counts["1"] == 3
-        assert counts["2"] == 2  # now stale → the escalation refreshes it
+        assert counts["2"] == candidate_before + 1  # fresh: served, not refetched
 
     def test_active_in_backoff_keeps_trusted_headroom(self, temp_home, monkeypatch):
         # The active account's fetches are being refused (429 with a long
@@ -1623,7 +1655,12 @@ class TestAdaptiveScheduler:
         phase-2 escalation is reserved for ticks that would actually switch.
         The fetch-set spy also catches an accidental all-candidates request
         that reserve() would have served from the store without HTTP."""
-        h = self._harness(temp_home, monkeypatch, strategy="consume-first")
+        # Pin the active cadence at the 180s floor (ramp start 0, max 180):
+        # this test is about which sets get fetched, not the ramp.
+        h = self._harness(
+            temp_home, monkeypatch, strategy="consume-first",
+            poll_ramp_start_pct=0.0, poll_max_interval_seconds=180.0,
+        )
         # Active resets soonest -> every tick holds already-consuming-soonest.
         # five_hour 50 mirrors the baseline-cadence test's active plan.
         usage = {
@@ -1658,7 +1695,12 @@ class TestAdaptiveScheduler:
         chosen target (Retry-After backoff), the freshness gate holds with
         stale-usage instead of switching on old data; once the backoff lapses
         a later tick freshens the target and the switch lands."""
-        h = self._harness(temp_home, monkeypatch, strategy="consume-first")
+        # Active cadence pinned at the 180s floor so the t241 refetch below
+        # sees view_b; the scenario is about the freshness gate.
+        h = self._harness(
+            temp_home, monkeypatch, strategy="consume-first",
+            poll_ramp_start_pct=0.0, poll_max_interval_seconds=180.0,
+        )
         counts: dict[str, int] = {}
         # Populate the store while the active account resets soonest (holds).
         view_a = {
@@ -2131,14 +2173,18 @@ class TestRunLoop:
         assert harness.engine._next_delay(TickOutcome.BLOCKED) == 300.0
 
     def test_blocked_on_resolvable_condition_keeps_normal_cadence(self, harness):
+        TestLoopObeysThePollPlan._plan_all(harness, active_due_in=1e6)
         harness.engine._sleep_until_ts = None
         harness.engine._blocked_wait_long = False
         delay = harness.engine._next_delay(TickOutcome.BLOCKED)
-        assert 0.9 * 60 <= delay <= 1.1 * 60
+        assert 0.9 * 300 <= delay <= 1.1 * 300
 
     def test_normal_delay_is_jittered_interval(self, harness):
+        # Nothing due: the cap (interval_seconds, default 300) bounds the
+        # sleep so local changes are still noticed.
+        TestLoopObeysThePollPlan._plan_all(harness, active_due_in=1e6)
         delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
-        assert 0.9 * 60 <= delay <= 1.1 * 60
+        assert 0.9 * 300 <= delay <= 1.1 * 300
 
     def test_sleep_cap(self, harness):
         harness.engine._sleep_until_ts = harness.clock() + 50 * 3600
@@ -2149,57 +2195,83 @@ class TestRunLoop:
 
 
 class TestLoopObeysThePollPlan:
-    """The loop must not oversleep the plan the planner wrote.
+    """The loop sleeps until the next poll is due, never past its cap.
 
-    When the active account burns near the threshold the planner tightens its
-    row to URGENT_INTERVAL_S so the crossing is caught quickly. The loop used
-    to sleep ``interval_seconds`` regardless, so on any machine configured
-    slower than the plan (360s here, the default) that plan could not be
-    honoured: measured on the linux box mid-episode, the active row asked to
-    be polled 112s ago while the engine still had minutes of sleep left, and
-    the account sat over the threshold until the engine was restarted by hand.
+    Between fetches a tick only re-reads the store, so the loop wakes for the
+    active row's next poll, the soonest candidate poll, or a cooldown-blocked
+    switch becoming allowed — and otherwise sleeps ``interval_seconds``.
+    History: the loop used to sleep a fixed ``interval_seconds``, so a 60s
+    urgent plan ran late (measured mid-episode: the row was due 112s ago
+    while the engine still had minutes of sleep left).
     """
 
-    def _plan(self, harness, *, due_in: float) -> None:
-        num = harness.engine.switcher.current_account_number()
-        real = harness.engine.switcher.usage_entries_by_account
+    @staticmethod
+    def _plan_all(harness, *, active_due_in: float, others_due_in: float = 1e6):
+        """Every switchable row fetched now, each planned ``*_due_in`` out."""
+        engine = harness.engine
+        current = engine.switcher.current_account_number()
+        now = harness.clock()
+
+        def entry(due_in: float) -> UsageEntry:
+            # A consistent plan: interval == the wait (an interval far shorter
+            # than its deadline reads as an obsolete reset-parked plan → due).
+            return UsageEntry(
+                last_good=_usage(10),
+                fetched_at=now + min(due_in, 0.0),
+                age_s=0.0,
+                next_poll_at=now + due_in,
+                poll_interval_s=max(abs(due_in), 30.0),
+            )
 
         def patched(fetch=frozenset(), **kw):
-            entries = dict(real(fetch=fetch, **kw))
-            entries[num] = replace(
-                entries[num], next_poll_at=harness.clock() + due_in
-            )
-            return entries
+            return {
+                num: entry(active_due_in if num == current else others_due_in)
+                for num in engine.switcher.switchable_account_numbers()
+            }
 
-        harness.engine.switcher.usage_entries_by_account = patched
+        engine.switcher.usage_entries_by_account = patched
+
+    def _cap(self, harness, seconds: float) -> None:
+        harness.engine.settings = replace(
+            harness.engine.settings, interval_seconds=seconds
+        )
 
     def test_sleep_is_cut_to_the_rows_next_poll(self, harness):
-        harness.engine.settings = replace(
-            harness.engine.settings, interval_seconds=360.0
-        )
-        self._plan(harness, due_in=60.0)
-        # Pre-fix this returned ~360s and the 60s plan silently ran late.
+        self._cap(harness, 360.0)
+        self._plan_all(harness, active_due_in=60.0)
         assert harness.engine._next_delay(TickOutcome.NO_ACTION) == 60.0
 
-    def test_never_sleeps_below_the_planners_own_floor(self, harness):
-        """A row already overdue must not spin: the floor is the rate budget."""
-        harness.engine.settings = replace(
-            harness.engine.settings, interval_seconds=360.0
-        )
-        self._plan(harness, due_in=-500.0)
-        assert (
-            harness.engine._next_delay(TickOutcome.NO_ACTION)
-            == poll_policy.URGENT_INTERVAL_S
+    def test_a_burst_plan_is_followed(self, harness):
+        self._cap(harness, 360.0)
+        self._plan_all(harness, active_due_in=30.0)
+        assert harness.engine._next_delay(TickOutcome.NO_ACTION) == 30.0
+
+    def test_a_candidate_coming_due_wakes_the_loop(self, harness):
+        self._cap(harness, 360.0)
+        self._plan_all(harness, active_due_in=900.0, others_due_in=120.0)
+        assert harness.engine._next_delay(TickOutcome.NO_ACTION) == 120.0
+
+    def test_an_overdue_row_never_spins(self, harness):
+        """The collector may keep declining an overdue row (lock contention);
+        the loop must back off to its floor rather than spin."""
+        self._cap(harness, 360.0)
+        self._plan_all(harness, active_due_in=-500.0)
+        assert harness.engine._next_delay(TickOutcome.NO_ACTION) == (
+            autoswitch.MIN_LOOP_SLEEP_S
         )
 
-    def test_a_relaxed_plan_never_lengthens_the_sleep(self, harness):
-        """Only ever shortens — a distant plan must not stretch the cadence
-        past what the user configured."""
-        harness.engine.settings = replace(
-            harness.engine.settings, interval_seconds=60.0
-        )
-        self._plan(harness, due_in=3600.0)
+    def test_a_distant_plan_is_capped_by_interval_seconds(self, harness):
+        """A 15-minute plan never stretches the sleep past the cap: local
+        changes (a manual account switch) must still be noticed."""
+        self._cap(harness, 60.0)
+        self._plan_all(harness, active_due_in=3600.0)
         assert harness.engine._next_delay(TickOutcome.NO_ACTION) <= 1.1 * 60
+
+    def test_cooldown_end_wakes_the_loop(self, harness):
+        self._cap(harness, 360.0)
+        self._plan_all(harness, active_due_in=1e6)
+        harness.engine._cooldown_until_ts = harness.clock() + 45.0
+        assert harness.engine._next_delay(TickOutcome.NO_ACTION) == 45.0
 
     def test_a_store_failure_leaves_the_cadence_alone(self, harness):
         def boom(*a, **k):
@@ -2207,7 +2279,7 @@ class TestLoopObeysThePollPlan:
 
         harness.engine.switcher.usage_entries_by_account = boom
         delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
-        assert 0.9 * 60 <= delay <= 1.1 * 60
+        assert 0.9 * 300 <= delay <= 1.1 * 300
 
 
 class TestSessionThreshold:
@@ -2217,7 +2289,8 @@ class TestSessionThreshold:
         harness.engine.apply_threshold(72.0)
         assert harness.engine.settings.threshold == 72.0
         # Poll-cadence planning follows the new value immediately.
-        assert harness.switcher._poll_inputs_override == (72.0, ())
+        pinned = harness.switcher._poll_inputs_override
+        assert (pinned.threshold, pinned.models) == (72.0, ())
         # And the very next tick decides with it: 80% ≥ 72 switches, where
         # the constructed 90 would not have.
         outcome = harness.tick_with_usage({
@@ -6969,3 +7042,74 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+class TestRateLimitVisibility:
+    """The ticker line says which accounts were requested this tick, their
+    req/h, and a 429's retry-after / backoff — the data for tuning the ramp."""
+
+    def _poll(self, **kw) -> PollEvent:
+        return PollEvent(
+            active={"number": 1, "email": "a@x.com"},
+            headroom={"1": 60.0},
+            threshold=99.0,
+            **kw,
+        )
+
+    def test_success_shows_requests_per_hour(self):
+        text = self._poll(fetched=("1",), requests_last_hour={"1": 7}).human()
+        assert text.endswith(" · fetched #1 (7/h)")
+
+    def test_rate_limited_shows_retry_after_and_backoff(self):
+        until = datetime(2026, 10, 13, 14, 35).timestamp()
+        event = self._poll(
+            fetched=("1",),
+            requests_last_hour={"1": 29},
+            rate_limited={"1": {"retryAfterS": 0.0, "backoffUntil": until}},
+        )
+        assert (
+            "⚠ #1 rate-limited (429, retry-after 0s) · backing off until 14:35 (29/h)"
+            in event.human()
+        )
+        payload = event.to_json()
+        assert payload["rateLimited"]["1"]["retryAfterS"] == 0.0
+        assert payload["requestsLastHour"] == {"1": 29}
+
+    def test_headers_are_shown_when_sent(self):
+        event = self._poll(
+            fetched=("1",),
+            requests_last_hour={"1": 3},
+            rate_headers={"1": {"ratelimit-remaining": "12"}},
+        )
+        assert "#1 headers: ratelimit-remaining=12" in event.human()
+
+    def test_no_fetch_no_suffix_and_json_unchanged(self):
+        event = self._poll()
+        assert "fetched" not in event.human()
+        payload = event.to_json()
+        for key in ("fetched", "requestsLastHour", "rateLimited", "rateHeaders"):
+            assert key not in payload
+
+    def test_fetch_report_detects_this_ticks_requests(self):
+        before = {"1": UsageEntry(fetch_log=(100.0,)), "2": UsageEntry(fetch_log=(90.0,))}
+        after = {
+            "1": UsageEntry(fetch_log=(100.0, 160.0)),     # requested
+            "2": UsageEntry(fetch_log=(90.0,)),            # served from store
+            "3": UsageEntry(
+                fetch_log=(160.0,), last_error="http-429", backoff_until=460.0
+            ),                                              # first request, 429
+        }
+        report = autoswitch._fetch_report(before, after)
+        assert report["fetched"] == ("1", "3")
+        assert report["requests_last_hour"] == {"1": 2, "3": 1}
+        assert report["rate_limited"] == {
+            "3": {"retryAfterS": None, "backoffUntil": 460.0}
+        }
+
+    def test_sleep_event_reads_as_next_check(self):
+        until = datetime(2026, 10, 13, 21, 5, tzinfo=timezone.utc)
+        event = SleepEvent(
+            seconds=840.0,
+            until=until.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        )
+        local = until.astimezone().strftime("%H:%M")
+        assert event.human() == f"next check in 14m ({local})"

@@ -53,7 +53,7 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
+from claude_swap.usage_store import due_at, due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -95,6 +95,11 @@ FRESHEN_BUFFER_MS = 10 * 60 * 1000
 # a long engine sleep must not suppress the fetch that discovers it.
 MAX_SLEEP_S = poll_policy.EXHAUSTED_INTERVAL_S
 NO_RESET_FALLBACK_S = 300.0
+# The loop sleeps until the next poll is due; never tighter than this, so an
+# overdue row the collector refuses (lock contention, store hiccup) can't spin.
+MIN_LOOP_SLEEP_S = 5.0
+# Only sleeps longer than this get a SleepEvent ("next check …") line.
+SLEEP_EVENT_MIN_S = 60.0
 
 # Idle-hold cap (elapsed, not ticks — the hold itself slows the cadence to
 # NO_RESET_FALLBACK_S): an owned-and-expired token normally means Claude Code
@@ -314,6 +319,16 @@ class PollEvent(AutoSwitchEvent):
     # (e.g. "89%") hides which window binds — #115 was reported off that
     # ambiguity.
     windows: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Rate-limit visibility (additive). Accounts whose usage endpoint was
+    # actually requested this tick, in fetch order; each one's request count
+    # over the trailing hour (every cswap surface on this machine — the
+    # number to hold against the endpoint's ~28-30/hour budget); a 429 this
+    # tick as {"retryAfterS", "backoffUntil"}; and any rate-limit-like
+    # response headers the endpoint sent.
+    fetched: tuple[str, ...] = ()
+    requests_last_hour: dict[str, int] = field(default_factory=dict)
+    rate_limited: dict[str, dict] = field(default_factory=dict)
+    rate_headers: dict[str, dict[str, str]] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         fields = {
@@ -325,7 +340,39 @@ class PollEvent(AutoSwitchEvent):
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
             fields["windowsPct"] = self.windows
+        if self.fetched:
+            fields["fetched"] = list(self.fetched)
+        if self.requests_last_hour:
+            fields["requestsLastHour"] = self.requests_last_hour
+        if self.rate_limited:
+            fields["rateLimited"] = self.rate_limited
+        if self.rate_headers:
+            fields["rateHeaders"] = self.rate_headers
         return fields
+
+    def _fetch_text(self) -> str:
+        """`` · fetched #2 (7/h)`` / `` · ⚠ #2 rate-limited …`` suffix."""
+        parts: list[str] = []
+        for num in self.fetched:
+            count = self.requests_last_hour.get(num)
+            per_hour = f" ({count}/h)" if count is not None else ""
+            limited = self.rate_limited.get(num)
+            if limited is not None:
+                after = limited.get("retryAfterS")
+                cause = "429" if after is None else f"429, retry-after {after:.0f}s"
+                until = limited.get("backoffUntil")
+                backing = ""
+                if until:
+                    clock = datetime.fromtimestamp(until).strftime("%H:%M")
+                    backing = f" · backing off until {clock}"
+                parts.append(f"⚠ #{num} rate-limited ({cause}){backing}{per_hour}")
+            else:
+                parts.append(f"fetched #{num}{per_hour}")
+            headers = self.rate_headers.get(num)
+            if headers:
+                shown = ", ".join(f"{k}={v}" for k, v in sorted(headers.items()))
+                parts.append(f"#{num} headers: {shown}")
+        return "".join(f" · {p}" for p in parts)
 
     def _describe(self, num: str) -> str:
         wins = self.windows.get(num)
@@ -355,7 +402,7 @@ class PollEvent(AutoSwitchEvent):
         tail = f" | others: {others}" if others else ""
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {pct_label(self.threshold)}%){tail}"
+            f"(switch at {pct_label(self.threshold)}%){tail}{self._fetch_text()}"
         )
 
 
@@ -459,7 +506,16 @@ class SleepEvent(AutoSwitchEvent):
         return {"seconds": round(self.seconds, 1), "until": self.until}
 
     def human(self) -> str:
-        return f"sleeping {self.seconds / 60:.0f}m (until {self.until})"
+        try:
+            local = datetime.fromisoformat(
+                self.until.replace("Z", "+00:00")
+            ).astimezone()
+            clock = local.strftime("%H:%M")
+        except ValueError:
+            clock = self.until
+        mins = self.seconds / 60
+        span = f"{mins:.0f}m" if mins >= 1 else f"{self.seconds:.0f}s"
+        return f"next check in {span} ({clock})"
 
 
 @dataclass(frozen=True)
@@ -633,6 +689,45 @@ def _every_account_above_threshold(
     return all((100.0 - h) >= threshold for h in measured)
 
 
+def _fetch_report(pre: dict, post: dict) -> dict:
+    """PollEvent rate-limit fields: which accounts this tick requested (their
+    trailing-hour request log grew), their req/h, 429 details, headers.
+
+    No clock read: the store already prunes ``fetch_log`` to the trailing
+    hour when it builds the entry, so its length is the count."""
+    fetched: list[str] = []
+    per_hour: dict[str, int] = {}
+    limited: dict[str, dict] = {}
+    headers: dict[str, dict[str, str]] = {}
+    for num, entry in post.items():
+        before = pre.get(num)
+        before_log = before.fetch_log if before is not None else ()
+        # Append-only log: its newest stamp moves exactly when a request ran.
+        if not entry.fetch_log or (before_log and entry.fetch_log[-1] == before_log[-1]):
+            continue
+        fetched.append(num)
+        per_hour[num] = len(entry.fetch_log)
+        seen = oauth.rate_headers_for(num)
+        if seen:
+            headers[num] = seen
+        if entry.last_error == "http-429":
+            after = seen.get("retry-after")
+            try:
+                after_s = float(after) if after is not None else None
+            except ValueError:
+                after_s = None
+            limited[num] = {
+                "retryAfterS": after_s,
+                "backoffUntil": entry.backoff_until,
+            }
+    return {
+        "fetched": tuple(fetched),
+        "requests_last_hour": per_hour,
+        "rate_limited": limited,
+        "rate_headers": headers,
+    }
+
+
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
 
@@ -678,7 +773,9 @@ class AutoSwitchEngine:
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
-        switcher.set_poll_policy_inputs(settings.threshold, self._models)
+        switcher.set_poll_policy_inputs(
+            poll_policy.PollInputs.from_settings(settings, self._models)
+        )
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
@@ -692,6 +789,10 @@ class AutoSwitchEngine:
         # outcome is static enough (truly exhausted / no candidates) to wait
         # longer than the normal interval.
         self._sleep_until_ts: float | None = None
+        # When a cooldown-blocked switch becomes allowed (wakes the loop).
+        self._cooldown_until_ts: float | None = None
+        # The store snapshot taken before this tick's fetches (fetch report).
+        self._pre_fetch_entries: dict = {}
         self._blocked_wait_long = False
         # Idle-hold: when the active token expired while Claude Code owns it
         # (and is therefore idle), crawl instead of counting unhealthy ticks.
@@ -910,6 +1011,7 @@ class AutoSwitchEngine:
 
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
+        self._cooldown_until_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         settings = self.settings
@@ -953,14 +1055,17 @@ class AutoSwitchEngine:
             "email": "",
         }
 
+        self._pre_fetch_entries = {}
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
+        fetch_report = _fetch_report(self._pre_fetch_entries, entries)
         self._emit(
             PollEvent(
                 active=active_ref,
                 headroom=headroom,
                 threshold=settings.threshold,
+                **fetch_report,
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -1067,6 +1172,7 @@ class AutoSwitchEngine:
             trigger = "failover"
 
         if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            self._note_cooldown_wake(state)
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -2033,6 +2139,7 @@ class AutoSwitchEngine:
         ]
 
         pre = self.switcher.usage_entries_by_account(fetch=set())
+        self._pre_fetch_entries = pre
         plan: set[str] = set()
         active_pre = pre.get(current)
         # The active account is nominated when never fetched, poll-due per its
@@ -2043,13 +2150,27 @@ class AutoSwitchEngine:
         # over from a role change the switcher never saw (e.g. a manual
         # login) is overridden past the active age cap. Exhausted accounts
         # carry their own bounded plan and become due normally.
+        # The cap is the active ramp's own interval at this utilization, so a
+        # deliberate long wait with lots of room left is never mistaken for a
+        # leftover candidate plan.
+        active_pre_pct = (
+            binding_pct(active_pre.last_good, self._models)
+            if active_pre is not None
+            else None
+        )
+        active_cap = poll_policy.active_interval_for(
+            active_pre_pct,
+            threshold if threshold is not None else self.settings.threshold,
+            **poll_policy.PollInputs.from_settings(
+                self.settings, self._models
+            ).ramp_kwargs(),
+        )
         stale_candidate_plan = (
             active_pre is not None
             and active_pre.age_s is not None
-            and active_pre.age_s >= poll_policy.ACTIVE_MAX_INTERVAL_S
-            and (active_pre.poll_interval_s or 0.0)
-            > poll_policy.ACTIVE_MAX_INTERVAL_S
-            and (binding_pct(active_pre.last_good, self._models) or 0.0) < 100.0
+            and active_pre.age_s >= active_cap
+            and (active_pre.poll_interval_s or 0.0) > active_cap
+            and (active_pre_pct or 0.0) < 100.0
         )
         overslept_plan = (
             active_pre is not None
@@ -2157,6 +2278,7 @@ class AutoSwitchEngine:
         with self._state_lock():
             state = self._read_state()
             if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+                self._note_cooldown_wake(state)
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2204,6 +2326,12 @@ class AutoSwitchEngine:
         return TickOutcome.SWITCHED
 
     # -- helpers --------------------------------------------------------------
+
+    def _note_cooldown_wake(self, state: dict) -> None:
+        """A switch was wanted but cooldown-blocked: wake when it lifts."""
+        last = state.get("lastSwitchAt")
+        if isinstance(last, (int, float)):
+            self._cooldown_until_ts = last + self.settings.cooldown_seconds
 
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")
@@ -2313,9 +2441,13 @@ class AutoSwitchEngine:
         state) are fixed at construction. The frozen-settings swap is atomic
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
-        self.switcher.set_poll_policy_inputs(threshold, self._models)
+        self.switcher.set_poll_policy_inputs(
+            poll_policy.PollInputs.from_settings(self.settings, self._models)
+        )
 
     def _next_delay(self, outcome: TickOutcome) -> float:
+        # ``interval_seconds`` caps the sleep between local checks; the usage
+        # cadence itself comes from the poll plans (see _until_next_due).
         interval = self.settings.interval_seconds
         if outcome is TickOutcome.BLOCKED:
             if self._sleep_until_ts is not None:
@@ -2332,39 +2464,54 @@ class AutoSwitchEngine:
             # until the user comes back, so crawl. Worst case protection
             # resumes one slow tick after they do.
             return max(interval, NO_RESET_FALLBACK_S)
-        # ±10% jitter so multiple machines don't synchronize their API hits.
-        return self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
+        # ±10% jitter on the cap so multiple machines don't tick in lockstep;
+        # the poll plans carry their own jitter.
+        return self._until_next_due(interval * (0.9 + 0.2 * random.random()))
 
-    def _respect_poll_plan(self, delay: float) -> float:
-        """Shorten a normal-cadence sleep to the store's own next-poll time.
+    def _until_next_due(self, cap: float) -> float:
+        """Sleep until the next tick can see something new, at most ``cap``.
 
-        The planner tightens the active row to URGENT_INTERVAL_S while it
-        burns toward the threshold, but the loop always slept
-        ``interval_seconds`` — so the plan ran late. Measured mid-episode: the
-        row was due 112s ago while the engine still had minutes of sleep left.
+        Between fetches a tick only re-reads the store and re-decides on the
+        same numbers, so the loop wakes for: the active account's next poll,
+        the soonest candidate poll (the baseline nominates one due candidate
+        per tick), and a cooldown-blocked switch becoming allowed. ``cap``
+        (``interval_seconds``) bounds the sleep so local changes — a manual
+        account switch, a re-login releasing a quarantine — are still seen.
 
-        Only ever shortens, never below the planner's floor: the 429 budget
-        lives in the plan, and this makes the loop obey it rather than
-        override it. Best-effort — the unshortened delay is always safe.
+        Never below MIN_LOOP_SLEEP_S, so an overdue row the collector keeps
+        declining cannot spin the loop; the 429 budget lives in the plans,
+        and this only makes the loop follow them. Best-effort: on any store
+        hiccup the capped delay is always safe.
         """
+        now = self.clock()
+        deadlines: list[float] = []
+        if self._cooldown_until_ts is not None:
+            deadlines.append(self._cooldown_until_ts)
         try:
             current = self.switcher.current_account_number()
-            if current is None:
-                return delay
-            entry = self.switcher.usage_entries_by_account(fetch=set()).get(current)
-            if entry is None or entry.next_poll_at is None:
-                return delay
-            due_in = entry.next_poll_at - self.clock()
-            # Clamp the DEADLINE, not the result. max(min(delay, due_in), U)
-            # raises a delay that was ALREADY below U: at the configurable
-            # floor of 15s it turns a 13.5s jittered sleep into 60s, and at
-            # the 60s default it flattens the entire lower jitter half.
-            # Bounding due_in instead keeps "only ever shortens" true at every
-            # configured interval, and still refuses to poll faster than the
-            # planner's own floor when the row is overdue.
-            return min(delay, max(due_in, poll_policy.URGENT_INTERVAL_S))
+            entries = self.switcher.usage_entries_by_account(fetch=set())
+            state = self._read_state()
+            quarantine = state.get("quarantine")
+            quarantined = set(quarantine) if isinstance(quarantine, dict) else set()
+            if current is not None:
+                active_due = due_at(
+                    entries.get(current), now,
+                    no_plan_wait_s=poll_policy.MIN_INTERVAL_S,
+                )
+                if active_due is not None:
+                    deadlines.append(active_due)
+            if self._idle_hold_since is None:
+                for num in self.switcher.switchable_account_numbers():
+                    if num == current or num in quarantined:
+                        continue
+                    due = due_at(entries.get(num), now)
+                    if due is not None:
+                        deadlines.append(due)
         except Exception:
-            return delay
+            return cap
+        if not deadlines:
+            return cap
+        return min(cap, max(min(deadlines) - now, MIN_LOOP_SLEEP_S))
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
@@ -2383,7 +2530,7 @@ class AutoSwitchEngine:
                 )
                 outcome = TickOutcome.ERROR
             delay = self._next_delay(outcome)
-            if delay > self.settings.interval_seconds * 1.5:
+            if delay > SLEEP_EVENT_MIN_S:
                 until = datetime.now(timezone.utc) + timedelta(seconds=delay)
                 self._emit(
                     SleepEvent(

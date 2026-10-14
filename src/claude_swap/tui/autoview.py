@@ -28,6 +28,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
+from claude_swap import poll_policy
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
@@ -56,6 +57,8 @@ _QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
 def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Text:
     """Log line for one engine event, styled like the CLI's human renderer."""
     role = _EVENT_ROLES.get(event.kind)
+    if getattr(event, "rate_limited", None):
+        role = "sev_warn"  # a 429 this tick: the line tuning the ramp is for
     if role is not None:
         style = getattr(palette, role)
     else:
@@ -134,6 +137,9 @@ class AutoScreen(Screen):
         self.app.threshold_pct = self._settings.threshold
         self._update_summary()
         self.watch(self.app, "theme", self._on_theme_change)
+        # The summary shows the active account's planned usage cadence,
+        # which moves with every fetch.
+        self.watch(self.app, "snapshot", lambda _snap: self._update_summary())
         live = self._settings.tui_starts_live
         self._start_engine(
             dry_run=not live, note="autoswitch.tuiStartsLive" if live else None
@@ -223,10 +229,23 @@ class AutoScreen(Screen):
         )
         if self._settings.threshold != self._configured_threshold:
             text.append(" (session)", style=palette.muted)
-        text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
+        text.append(f" · {self._cadence_text()}")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
+
+    def _cadence_text(self) -> str:
+        """The active account's planned usage-poll cadence, from its row."""
+        snap = self.app.snapshot
+        active = next(
+            (a for a in (snap.accounts if snap else ()) if a.is_active), None
+        )
+        interval = active.usage.poll_interval_s if active is not None else None
+        if interval is None:
+            return "usage checks adapt to room left"
+        if interval < poll_policy.MIN_INTERVAL_S:
+            return f"usage check every {interval:.0f}s (burst)"
+        return f"usage check every ~{interval / 60:.0f}m"
 
     # -- engine -------------------------------------------------------------
 

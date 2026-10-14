@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import random
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 
 from claude_swap import oauth
@@ -78,18 +79,28 @@ SERVE_TTL_S = 180.0
 # below.
 MIN_INTERVAL_S = 180.0
 
-# Urgent mode: the ACTIVE account, within ESCALATION_MARGIN_PCT of the
-# switch threshold, with movement observed this poll (i.e. actually burning
-# toward the limit). Bounded by construction: either the threshold is crossed
-# (the engine switches away) or the movement stops (the next poll decays back
-# to MIN_INTERVAL_S) — worst case margin/movement-delta ≈ 15 polls per
-# episode, inside the measured ~28-30 request rolling-hour window; overshoot
-# on top of steady traffic is absorbed by the post-429 floor below.
+# Burst ("urgent") mode: the ACTIVE account at/above BURST_START_PCT used,
+# with movement observed this poll (i.e. actually burning toward the limit).
+# Bounded by construction, not by speed: each burst poll needs a fresh
+# MOVEMENT_DELTA_PCT rise, so an episode costs about (threshold - burst
+# start) / delta polls plus a MIN_INTERVAL_S poll whenever usage pauses —
+# 90→99 is ~9 burst polls — inside the measured ~28-30 request rolling-hour
+# window; overshoot on top of steady traffic is absorbed by the post-429
+# floor below. Both are settings (autoswitch.pollBurstStartPct /
+# pollBurstIntervalSeconds); these are the defaults.
 URGENT_INTERVAL_S = 60.0
+BURST_START_PCT = 75.0
 
-# Decay ceilings for an account whose usage is not moving: the active account
-# stays reasonably fresh, an idle alternate drifts out to ten minutes.
-ACTIVE_MAX_INTERVAL_S = 300.0
+# The active account's not-moving cadence ramps on ROOM LEFT: at or below
+# RAMP_START_PCT used it waits ACTIVE_FAR_INTERVAL_S, shortening linearly to
+# MIN_INTERVAL_S at the burst start (see active_interval_for). Settings
+# autoswitch.pollRampStartPct / pollMaxIntervalSeconds; these are defaults.
+RAMP_START_PCT = 50.0
+ACTIVE_FAR_INTERVAL_S = 900.0
+
+# Decay ceilings for an idle alternate (candidates still adapt on movement).
+# The ceiling actually used is max(CANDIDATE_MAX_INTERVAL_S, far interval):
+# the engine refetches every candidate before any switch decision anyway.
 CANDIDATE_DEFAULT_INTERVAL_S = 300.0
 CANDIDATE_MAX_INTERVAL_S = 600.0
 
@@ -147,6 +158,39 @@ ESCALATION_MARGIN_PCT = 15.0
 RESET_SLACK_S = 60.0
 
 
+@dataclass(frozen=True)
+class PollInputs:
+    """Everything poll planning keys on, from the effective settings: the
+    switch threshold, the scoped models, and the ramp/burst knobs."""
+
+    threshold: float
+    models: tuple[str, ...] = ()
+    ramp_start_pct: float = RAMP_START_PCT
+    far_interval_s: float = ACTIVE_FAR_INTERVAL_S
+    burst_start_pct: float = BURST_START_PCT
+    burst_interval_s: float = URGENT_INTERVAL_S
+
+    @classmethod
+    def from_settings(cls, settings, models: tuple[str, ...]) -> "PollInputs":
+        """From an ``AutoSwitchSettings`` (duck-typed: no settings import)."""
+        return cls(
+            threshold=settings.threshold,
+            models=models,
+            ramp_start_pct=settings.poll_ramp_start_pct,
+            far_interval_s=settings.poll_max_interval_seconds,
+            burst_start_pct=settings.poll_burst_start_pct,
+            burst_interval_s=settings.poll_burst_interval_seconds,
+        )
+
+    def ramp_kwargs(self) -> dict:
+        """The ``active_interval_for`` keyword arguments."""
+        return {
+            "ramp_start_pct": self.ramp_start_pct,
+            "far_interval_s": self.far_interval_s,
+            "burst_start_pct": self.burst_start_pct,
+        }
+
+
 def binding_pct(usage: dict | None, models: tuple[str, ...] = ()) -> float | None:
     """Utilization of the binding (worst) relevant window, or None."""
     headroom = oauth.account_headroom(usage, models)
@@ -181,6 +225,34 @@ def earliest_future_reset_ts(
     return earliest
 
 
+def active_interval_for(
+    pct: float | None,
+    threshold: float,
+    *,
+    ramp_start_pct: float = RAMP_START_PCT,
+    far_interval_s: float = ACTIVE_FAR_INTERVAL_S,
+    burst_start_pct: float = BURST_START_PCT,
+) -> float:
+    """The active account's not-moving poll interval at ``pct`` used.
+
+    ``far_interval_s`` at or below the ramp start, ``MIN_INTERVAL_S`` at or
+    above the burst start (capped at the threshold: there is no burst zone
+    past the switch point), a straight line in between. Unknown utilization
+    takes ``MIN_INTERVAL_S`` — not knowing is no reason to wait long.
+    """
+    if pct is None:
+        return MIN_INTERVAL_S
+    far = max(far_interval_s, MIN_INTERVAL_S)
+    end = min(burst_start_pct, threshold)
+    start = min(ramp_start_pct, end)
+    if pct >= end:
+        return MIN_INTERVAL_S
+    if pct <= start:
+        return far
+    frac = (pct - start) / (end - start)
+    return far - frac * (far - MIN_INTERVAL_S)
+
+
 def parse_reset_ts(resets_at: str | None) -> float | None:
     if not resets_at:
         return None
@@ -203,14 +275,20 @@ def plan_after_fetch(
     recent_429: bool,
     now: float,
     rng: Callable[[], float] = random.random,
+    ramp_start_pct: float = RAMP_START_PCT,
+    far_interval_s: float = ACTIVE_FAR_INTERVAL_S,
+    burst_start_pct: float = BURST_START_PCT,
+    burst_interval_s: float = URGENT_INTERVAL_S,
 ) -> tuple[float, float]:
     """``(next_poll_at, interval_s)`` for an account just fetched successfully.
 
-    Movement (binding pct changed ≥ ``MOVEMENT_DELTA_PCT`` since the previous
-    poll) halves the interval, floored at ``MIN_INTERVAL_S`` — or drops to
-    ``URGENT_INTERVAL_S`` when the active account is moving inside the
-    escalation band. No movement backs off ×1.5 toward the account's ceiling;
-    unknown utilization uses the default. A recent 429 on this token floors
+    The ACTIVE account's interval comes from room left
+    (:func:`active_interval_for`), dropping to ``burst_interval_s`` when it
+    is at/above the burst start and moved ≥ ``MOVEMENT_DELTA_PCT`` since the
+    previous poll. A CANDIDATE adapts on movement: movement halves the
+    interval (floored at ``MIN_INTERVAL_S``), no movement backs off ×1.5
+    toward ``max(CANDIDATE_MAX_INTERVAL_S, far_interval_s)``; unknown
+    utilization uses the default. A recent 429 on this token floors
     the cadence at ``POST_429_MIN_INTERVAL_S`` (and suppresses urgent mode)
     until ``RECENT_429_WINDOW_S`` has passed. The scheduled time gets
     ``JITTER_FRAC`` noise, is never later than the account's next window
@@ -219,30 +297,39 @@ def plan_after_fetch(
     quota grant is observed and its decision-grade status stays current.
     """
     default = MIN_INTERVAL_S if is_active else CANDIDATE_DEFAULT_INTERVAL_S
-    ceiling = ACTIVE_MAX_INTERVAL_S if is_active else CANDIDATE_MAX_INTERVAL_S
+    ceiling = max(CANDIDATE_MAX_INTERVAL_S, far_interval_s)
     base = prev_interval_s or default
     prev_pct = binding_pct(prev_usage, models)
     new_pct = binding_pct(new_usage, models)
-    if prev_pct is None or new_pct is None:
-        moving = False
+    moving = (
+        prev_pct is not None
+        and new_pct is not None
+        and abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT
+    )
+    if is_active:
+        # Room left decides, not movement. The ramp ignores `base`, so a
+        # burst interval snaps straight back once movement stops.
+        interval = active_interval_for(
+            new_pct,
+            threshold,
+            ramp_start_pct=ramp_start_pct,
+            far_interval_s=far_interval_s,
+            burst_start_pct=burst_start_pct,
+        )
+    elif prev_pct is None or new_pct is None:
         interval = default
-    elif abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT:
-        moving = True
+    elif moving:
         interval = max(MIN_INTERVAL_S, base / 2)
     else:
-        # Floored so a sub-floor base (urgent mode's 60s) snaps straight back
-        # to the normal cadence once movement stops, instead of decaying
-        # through 90s/135s polls that the budget never intended.
-        moving = False
         interval = min(ceiling, max(MIN_INTERVAL_S, base * 1.5))
     if (
         is_active
         and moving
         and not recent_429
         and new_pct is not None
-        and new_pct >= threshold - ESCALATION_MARGIN_PCT
+        and new_pct >= min(burst_start_pct, threshold)
     ):
-        interval = URGENT_INTERVAL_S
+        interval = burst_interval_s
     if recent_429:
         # AIMD additive-increase: grow the interval multiplicatively from the
         # last one toward the wider 429 ceiling, so machines sharing a
