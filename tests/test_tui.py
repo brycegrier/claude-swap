@@ -703,7 +703,7 @@ class TestRunAction:
 
 @pytest.mark.asyncio
 class TestDashboard:
-    async def test_panel_shows_active_full_and_others_mini(self, tmp_path):
+    async def test_panel_shows_every_account_full(self, tmp_path):
         fake = FakeSwitcher(
             [
                 make_account(1, active=True, entry=make_entry(47.0, 63.0)),
@@ -718,11 +718,11 @@ class TestDashboard:
 
             panel = app.screen.query_one(AccountsPanel).render().plain
             assert "user1@example.com" in panel and "● active" in panel
-            assert "resets" in panel  # the active card is the full one
+            assert "resets" in panel
             assert "user2@example.com" in panel and "92%" in panel
-            # the mini line has no bars — bar glyphs only in the active card
-            mini_part = panel.split("user2@example.com", 1)[1]
-            assert "━" not in mini_part
+            # the inactive account gets the same full card: bars and resets
+            other = panel.split("user2@example.com", 1)[1]
+            assert "━" in other and "resets" in other
 
     async def test_disabled_marker_on_active_card_and_mini(self, tmp_path):
         # A disabled account is still shown; it's just annotated so the user
@@ -767,7 +767,7 @@ class TestDashboard:
             assert "usage unknown" not in panel
             assert "Fable" in panel and "62%" in panel
 
-    async def test_mini_line_skips_absent_window(self, tmp_path):
+    async def test_card_skips_absent_window(self, tmp_path):
         fake = FakeSwitcher(
             [
                 make_account(1, active=True),
@@ -781,9 +781,9 @@ class TestDashboard:
             from claude_swap.tui.widgets import AccountsPanel
 
             panel = app.screen.query_one(AccountsPanel).render().plain
-            mini_part = panel.split("user2@example.com", 1)[1]
-            assert "5h 92%" in mini_part
-            assert "7d" not in mini_part
+            other = panel.split("user2@example.com", 1)[1]
+            assert "5h" in other and "92%" in other
+            assert "7d" not in other
 
     async def test_menu_is_default_navigation_and_nests(self, tmp_path):
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)

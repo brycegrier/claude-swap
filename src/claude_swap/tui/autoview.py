@@ -242,10 +242,15 @@ class AutoScreen(Screen):
         )
         interval = active.usage.poll_interval_s if active is not None else None
         if interval is None:
-            return "usage checks adapt to room left"
+            return "usage polls adapt to room left"
         if interval < poll_policy.MIN_INTERVAL_S:
-            return f"usage check every {interval:.0f}s (burst)"
-        return f"usage check every ~{interval / 60:.0f}m"
+            text = f"usage polled every {interval:.0f}s (burst)"
+        else:
+            text = f"usage polled every ~{interval / 60:.0f}m"
+        next_at = active.usage.next_poll_at
+        if next_at is not None:
+            text += f", next {time.strftime('%H:%M', time.localtime(next_at))}"
+        return text
 
     # -- engine -------------------------------------------------------------
 

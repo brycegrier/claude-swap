@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Callable
 
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.containers import VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, ListView, Static
 
@@ -72,7 +73,10 @@ class DashboardScreen(Screen):
         self._menu_stack: list[tuple[str, MenuEntries]] = []
 
     def compose(self) -> ComposeResult:
-        yield AccountsPanel(id="accounts-panel")
+        # Every account full-size; scrolls past half the screen so the menu
+        # below always keeps its room.
+        with VerticalScroll(id="accounts-panel-scroll"):
+            yield AccountsPanel(full=True, id="accounts-panel")
         yield Static("", id="menu-title")
         yield ListView(id="menu")
         yield Footer()

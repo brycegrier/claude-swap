@@ -501,21 +501,41 @@ class SleepEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "sleep"
     seconds: float
     until: str
+    # Seconds until the soonest usage poll comes due (additive). A wake can
+    # be EARLIER than that: the loop is capped at interval_seconds so local
+    # changes are noticed, and such a wake makes no API request — the two
+    # must not read as the same thing.
+    next_poll_in_s: float | None = None
 
     def _fields(self) -> dict:
-        return {"seconds": round(self.seconds, 1), "until": self.until}
+        fields = {"seconds": round(self.seconds, 1), "until": self.until}
+        if self.next_poll_in_s is not None:
+            fields["nextPollInS"] = round(self.next_poll_in_s, 1)
+        return fields
+
+    @staticmethod
+    def _span(seconds: float) -> str:
+        return f"{seconds / 60:.0f}m" if seconds >= 60 else f"{seconds:.0f}s"
 
     def human(self) -> str:
         try:
-            local = datetime.fromisoformat(
+            wake = datetime.fromisoformat(
                 self.until.replace("Z", "+00:00")
             ).astimezone()
-            clock = local.strftime("%H:%M")
         except ValueError:
-            clock = self.until
-        mins = self.seconds / 60
-        span = f"{mins:.0f}m" if mins >= 1 else f"{self.seconds:.0f}s"
-        return f"next check in {span} ({clock})"
+            return f"next check in {self._span(self.seconds)} ({self.until})"
+        clock = wake.strftime("%H:%M")
+        if self.next_poll_in_s is None:
+            return f"next check in {self._span(self.seconds)} ({clock})"
+        if self.next_poll_in_s <= self.seconds + 1.0:
+            return f"next usage poll in {self._span(self.seconds)} ({clock})"
+        poll_clock = (
+            wake + timedelta(seconds=self.next_poll_in_s - self.seconds)
+        ).strftime("%H:%M")
+        return (
+            f"next usage poll in {self._span(self.next_poll_in_s)} "
+            f"({poll_clock}) · local check in {self._span(self.seconds)}"
+        )
 
 
 @dataclass(frozen=True)
@@ -791,6 +811,8 @@ class AutoSwitchEngine:
         self._sleep_until_ts: float | None = None
         # When a cooldown-blocked switch becomes allowed (wakes the loop).
         self._cooldown_until_ts: float | None = None
+        # Seconds to the soonest due usage poll, for the SleepEvent line.
+        self._next_poll_in_s: float | None = None
         # The store snapshot taken before this tick's fetches (fetch report).
         self._pre_fetch_entries: dict = {}
         self._blocked_wait_long = False
@@ -2446,6 +2468,7 @@ class AutoSwitchEngine:
         )
 
     def _next_delay(self, outcome: TickOutcome) -> float:
+        self._next_poll_in_s = None  # set by _until_next_due when known
         # ``interval_seconds`` caps the sleep between local checks; the usage
         # cadence itself comes from the poll plans (see _until_next_due).
         interval = self.settings.interval_seconds
@@ -2485,6 +2508,7 @@ class AutoSwitchEngine:
         """
         now = self.clock()
         deadlines: list[float] = []
+        polls: list[float] = []
         if self._cooldown_until_ts is not None:
             deadlines.append(self._cooldown_until_ts)
         try:
@@ -2499,16 +2523,19 @@ class AutoSwitchEngine:
                     no_plan_wait_s=poll_policy.MIN_INTERVAL_S,
                 )
                 if active_due is not None:
-                    deadlines.append(active_due)
+                    polls.append(active_due)
             if self._idle_hold_since is None:
                 for num in self.switcher.switchable_account_numbers():
                     if num == current or num in quarantined:
                         continue
                     due = due_at(entries.get(num), now)
                     if due is not None:
-                        deadlines.append(due)
+                        polls.append(due)
         except Exception:
             return cap
+        if polls:
+            self._next_poll_in_s = max(min(polls) - now, 0.0)
+        deadlines.extend(polls)
         if not deadlines:
             return cap
         return min(cap, max(min(deadlines) - now, MIN_LOOP_SLEEP_S))
@@ -2538,6 +2565,7 @@ class AutoSwitchEngine:
                         until=until.isoformat(timespec="seconds").replace(
                             "+00:00", "Z"
                         ),
+                        next_poll_in_s=self._next_poll_in_s,
                     )
                 )
             self._wake.wait(delay)

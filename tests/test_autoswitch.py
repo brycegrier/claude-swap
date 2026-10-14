@@ -6,7 +6,7 @@ import json
 import os
 import threading
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -7113,3 +7113,18 @@ class TestRateLimitVisibility:
         )
         local = until.astimezone().strftime("%H:%M")
         assert event.human() == f"next check in 14m ({local})"
+
+    def test_sleep_event_tells_a_local_check_from_a_poll(self):
+        until = datetime(2026, 10, 13, 21, 5, tzinfo=timezone.utc)
+        iso = until.isoformat(timespec="seconds").replace("+00:00", "Z")
+        local = until.astimezone()
+        # The wake IS the poll.
+        due = SleepEvent(seconds=840.0, until=iso, next_poll_in_s=840.0)
+        assert due.human() == f"next usage poll in 14m ({local:%H:%M})"
+        # Woken early by the interval_seconds cap: no request at that wake.
+        capped = SleepEvent(seconds=300.0, until=iso, next_poll_in_s=600.0)
+        poll_at = (local + timedelta(seconds=300)).strftime("%H:%M")
+        assert capped.human() == (
+            f"next usage poll in 10m ({poll_at}) · local check in 5m"
+        )
+        assert capped.to_json()["nextPollInS"] == 600.0

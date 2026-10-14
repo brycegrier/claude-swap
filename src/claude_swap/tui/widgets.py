@@ -307,13 +307,17 @@ def mini_account_text(
 
 
 class AccountsPanel(Static):
-    """Static account overview: the active account full-size, others as
-    one-line minis (in slot order, expanded in place). The dashboard's — and
-    with ``show_minis=False`` the auto screen's — always-visible monitor."""
+    """Static account overview in slot order: the active account full-size,
+    others as one-line minis — or, with ``full=True`` (the dashboard), every
+    account as a full card. With ``show_minis=False`` (the auto screen) only
+    the active account is drawn."""
 
-    def __init__(self, *, show_minis: bool = True, id: str | None = None) -> None:
+    def __init__(
+        self, *, show_minis: bool = True, full: bool = False, id: str | None = None
+    ) -> None:
         super().__init__(id=id)
         self._show_minis = show_minis
+        self._full = full
 
     def on_mount(self) -> None:
         self.watch(self.app, "snapshot", lambda _snap: self.refresh(layout=True))
@@ -336,7 +340,7 @@ class AccountsPanel(Static):
         width = (self.size.width or 80) - 2
         blocks: list[Text] = []
         for acc in snap.accounts:
-            if acc.is_active:
+            if acc.is_active or self._full:
                 blocks.append(
                     account_card_text(
                         acc, width, threshold=app.threshold_pct, now=now,

@@ -8,11 +8,18 @@ Screen {
 
 /* -- accounts panel (the always-visible monitor) --------------------------- */
 
+#accounts-panel-scroll {
+    height: auto;
+    max-height: 60vh;
+    background: $background;
+    border-bottom: solid $panel;
+    scrollbar-size-vertical: 1;
+}
+
 #accounts-panel {
     height: auto;
     padding: 1 3;
     background: $background;
-    border-bottom: solid $panel;
 }
 
 #auto-active-panel {
