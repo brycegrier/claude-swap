@@ -30,8 +30,10 @@ from textual.widgets import Footer, RichLog, Static
 
 from claude_swap import poll_policy
 from claude_swap.autoswitch import (
+    TICKER_LABEL_WIDTH,
     AutoSwitchEngine,
     AutoSwitchEvent,
+    block_lines,
     binding_pct,
     pct_label,
 )
@@ -54,18 +56,29 @@ _EVENT_ROLES = {
 _QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
 
 
-def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Text:
-    """Log line for one engine event, styled like the CLI's human renderer."""
+def _row_style(event: AutoSwitchEvent, label: str, row: str, palette: Palette) -> str:
+    """The CLI's colors, per row: warnings stand out, the active account's
+    row is plain, routine rows are muted."""
+    if row.startswith("⚠"):
+        return palette.sev_warn  # a 429 or a quarantine: what tuning is for
     role = _EVENT_ROLES.get(event.kind)
-    if getattr(event, "rate_limited", None):
-        role = "sev_warn"  # a 429 this tick: the line tuning the ramp is for
     if role is not None:
-        style = getattr(palette, role)
-    else:
-        style = palette.muted if event.kind in _QUIET_KINDS else palette.foreground
+        return getattr(palette, role)
+    if event.kind == "poll" and label == "active":
+        return palette.foreground
+    return palette.muted if event.kind in _QUIET_KINDS else palette.foreground
+
+
+def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Text:
+    """One engine event in the labeled-block layout (``block_lines``),
+    styled like the CLI's human renderer."""
     text = Text()
-    text.append(f"{data.clock_stamp()}  ", style=palette.muted)
-    text.append(event.human(), style=style)
+    for i, (stamp, label, row) in enumerate(block_lines(event, data.clock_stamp())):
+        if i:
+            text.append("\n")
+        text.append(f"{stamp:<8}  ", style=palette.muted)
+        text.append(f"{label:<{TICKER_LABEL_WIDTH}} ", style=palette.muted)
+        text.append(row, style=_row_style(event, label, row, palette))
     return text
 
 

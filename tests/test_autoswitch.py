@@ -2067,11 +2067,11 @@ class TestEventsShape:
     def test_poll_event_human_line(self, harness):
         harness.tick_with_usage({"1": _usage(42), "2": _usage(10), "3": None})
         poll = next(e for e in harness.events if isinstance(e, PollEvent))
-        line = poll.human()
-        assert "Account-1" in line and "42% used" in line
+        rows = dict(poll.rows())
+        assert rows["active"].startswith("#1 a  42% used (switch at 90%)")
         # Others show per-window pcts, not just the ambiguous binding pct.
-        assert "#2: 5h 10% · 7d 0%" in line
-        assert "#3: ?" in line
+        assert "#2 5h 10%  7d 0%" in rows["others"]
+        assert "#3 ?" in rows["others"]
 
     def test_poll_event_windows_match_the_decision_set(self, temp_home):
         # Scoped windows appear only when configured: rendering an ignored
@@ -2095,14 +2095,14 @@ class TestEventsShape:
         plain = build()
         plain.tick_with_usage(usage)
         poll = next(e for e in plain.events if isinstance(e, PollEvent))
-        assert "#2: 5h 3% · 7d 89%" in poll.human()
+        assert "#2 5h 3%  7d 89%" in poll.human()
         assert "Fable" not in poll.human()
         assert poll.to_json()["windowsPct"]["2"] == {"5h": 3.0, "7d": 89.0}
 
         modeled = build(model="Fable")
         modeled.tick_with_usage(usage)
         poll = next(e for e in modeled.events if isinstance(e, PollEvent))
-        assert "#2: 5h 3% · 7d 89% · Fable 21%" in poll.human()
+        assert "#2 5h 3%  7d 89%  Fable 21%" in poll.human()
         assert poll.to_json()["windowsPct"]["2"] == {
             "5h": 3.0, "7d": 89.0, "Fable": 21.0,
         }
@@ -7067,8 +7067,12 @@ class TestRateLimitVisibility:
         )
 
     def test_success_shows_requests_per_hour(self):
-        text = self._poll(fetched=("1",), requests_last_hour={"1": 7}).human()
-        assert text.endswith(" · fetched #1 (7/h)")
+        rows = self._poll(fetched=("1",), requests_last_hour={"1": 7}).rows()
+        assert ("api", "polled #1 · 7 requests this hour") in rows
+        both = self._poll(
+            fetched=("1", "2"), requests_last_hour={"1": 7, "2": 3}
+        ).rows()
+        assert ("api", "polled #1 (7/h), #2 (3/h)") in both
 
     def test_rate_limited_shows_retry_after_and_backoff(self):
         until = datetime(2026, 10, 13, 14, 35).timestamp()
@@ -7078,9 +7082,10 @@ class TestRateLimitVisibility:
             rate_limited={"1": {"retryAfterS": 0.0, "backoffUntil": until}},
         )
         assert (
-            "⚠ #1 rate-limited (429, retry-after 0s) · backing off until 14:35 (29/h)"
-            in event.human()
-        )
+            "api",
+            "⚠ #1 rate-limited (retry-after 0s), backing off until "
+            f"{autoswitch._local_clock(until)} · 29 requests this hour",
+        ) in event.rows()
         payload = event.to_json()
         assert payload["rateLimited"]["1"]["retryAfterS"] == 0.0
         assert payload["requestsLastHour"] == {"1": 29}
@@ -7122,22 +7127,22 @@ class TestRateLimitVisibility:
             seconds=840.0,
             until=until.isoformat(timespec="seconds").replace("+00:00", "Z"),
         )
-        local = until.astimezone().strftime("%H:%M")
-        assert event.human() == f"next check in 14m ({local})"
+        local = autoswitch._local_clock(until.isoformat())
+        assert event.rows() == [("next", f"check {local} (in 14m)")]
 
     def test_sleep_event_tells_a_local_check_from_a_poll(self):
         until = datetime(2026, 10, 13, 21, 5, tzinfo=timezone.utc)
         iso = until.isoformat(timespec="seconds").replace("+00:00", "Z")
-        local = until.astimezone()
+        wake = autoswitch._local_clock(iso)
         # The wake IS the poll.
         due = SleepEvent(seconds=840.0, until=iso, next_poll_in_s=840.0)
-        assert due.human() == f"next usage poll in 14m ({local:%H:%M})"
+        assert due.rows() == [("next", f"poll {wake} (in 14m)")]
         # Woken early by the interval_seconds cap: no request at that wake.
         capped = SleepEvent(seconds=300.0, until=iso, next_poll_in_s=600.0)
-        poll_at = (local + timedelta(seconds=300)).strftime("%H:%M")
-        assert capped.human() == (
-            f"next usage poll in 10m ({poll_at}) · local check in 5m"
-        )
+        poll_at = autoswitch._local_clock(until.timestamp() + 300)
+        assert capped.rows() == [
+            ("next", f"poll {poll_at} (in 10m) · local check {wake}")
+        ]
         assert capped.to_json()["nextPollInS"] == 600.0
 
 
@@ -7171,7 +7176,7 @@ class TestLiveFeed:
         outcome = harness.tick_with_entries(self._stored(harness, self._usage3(50)))
         assert outcome is TickOutcome.SWITCHED
         poll = next(e for e in harness.events if isinstance(e, PollEvent))
-        assert poll.live and "95% used (live)" in poll.human()
+        assert poll.live and "95% used (switch at 90%) · live" in poll.human()
         sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "proactive"
 
@@ -7303,3 +7308,72 @@ class TestLimitHit:
         )
         nope = NoSwitchEvent(reason="no-candidates")
         assert _limit_hit_summary([nope]).startswith("cswap: rate limit hit — ")
+
+
+class TestTickerRows:
+    """The labeled-block ticker: rows per event, stamps, local times."""
+
+    def test_block_stamps_only_the_first_row_of_a_check(self):
+        poll = PollEvent(
+            active={"number": 2, "email": "sabaf@x.edu"},
+            headroom={"2": 8.0, "1": 96.0}, threshold=99.0,
+            fetched=("2",), requests_last_hour={"2": 21},
+        )
+        lines = autoswitch.block_lines(poll, "09:36:48")
+        assert lines == [
+            ("09:36:48", "active", "#2 sabaf  92% used (switch at 99%)"),
+            ("", "others", "#1 4%"),
+            ("", "api", "polled #2 · 21 requests this hour"),
+        ]
+        decision = NoSwitchEvent(reason="already-consuming-soonest", detail="x")
+        assert autoswitch.block_lines(decision, "09:36:48") == [
+            ("", "decision", "stay — this account resets soonest")
+        ]
+
+    def test_every_reason_code_has_a_phrase(self):
+        for code in autoswitch._REASON_TEXT:
+            text = NoSwitchEvent(reason=code, detail="1/3 before failover").human()
+            if "-" in code:
+                assert code not in text  # plain words, not the code name
+            assert text.split(" — ")[0] in ("stay", "wait", "skip")
+        stale = NoSwitchEvent(
+            reason="stale-usage", detail="account 3 usage could not be refreshed"
+        )
+        assert stale.human() == "wait — refreshing #3 before switching"
+        unknown = NoSwitchEvent(reason="brand-new", detail="why")
+        assert unknown.human() == "stay — brand-new: why"
+
+    def test_switch_rows(self):
+        sw = SwitchEvent(
+            trigger="at-limit",
+            from_ref={"number": 1, "email": "bdgrier@x.edu"},
+            to_ref={"number": 2, "email": "sabaf@x.edu"},
+        )
+        assert sw.rows() == [("decision", "➜ switched #1 → #2 sabaf (hit the limit)")]
+        dry = replace(sw, dry_run=True, trigger="proactive")
+        assert dry.human() == "➜ would switch #1 → #2 sabaf (reached the switch point)"
+
+    def test_all_exhausted_uses_local_time(self):
+        iso = "2026-10-15T05:20:00.433656Z"
+        event = AllExhaustedEvent(earliest_reset_at=iso)
+        assert event.human() == (
+            f"stay — every account is used up; first reset {autoswitch._local_clock(iso)}"
+        )
+        assert "T05:20" not in event.human()
+
+    def test_local_clock(self):
+        now = datetime.now().astimezone()
+        today = now.replace(hour=14, minute=35)
+        assert autoswitch._local_clock(today.timestamp()) == "14:35"
+        tomorrow = (now + timedelta(days=1)).replace(hour=5, minute=20)
+        assert autoswitch._local_clock(tomorrow.timestamp()) == "tomorrow 05:20"
+        later = (now + timedelta(days=3)).replace(hour=5, minute=20)
+        assert autoswitch._local_clock(later.isoformat()) == (
+            f"{later.strftime('%b')} {later.day} 05:20"
+        )
+        assert autoswitch._local_clock("garbage") == "garbage"
+
+    def test_json_is_unchanged_by_the_new_wording(self):
+        event = NoSwitchEvent(reason="cooldown")
+        assert event.to_json()["reason"] == "cooldown"
+        assert event.to_json()["detail"] == ""

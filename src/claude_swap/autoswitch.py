@@ -290,12 +290,72 @@ def pct_label(value: float) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _short_name(email: str | None) -> str:
+    """The readable part of an account email (``sabaf`` of ``sabaf@x.edu``)."""
+    return (email or "").split("@", 1)[0]
+
+
+def _ref_text(ref: dict | None) -> str:
+    if not ref:
+        return "?"
+    name = _short_name(ref.get("email"))
+    return f"#{ref.get('number')} {name}".rstrip()
+
+
+def _local_clock(value: float | str | None) -> str:
+    """A timestamp as local wall time: ``14:35`` today, ``tomorrow 05:20``,
+    ``Oct 16 05:20`` further out. Accepts epoch seconds or an ISO string;
+    anything unparseable is returned as-is."""
+    if value is None:
+        return "?"
+    try:
+        if isinstance(value, (int, float)):
+            when = datetime.fromtimestamp(float(value)).astimezone()
+        else:
+            when = datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone()
+    except (ValueError, OSError, OverflowError):
+        return str(value)
+    today = datetime.now().astimezone().date()
+    clock = when.strftime("%H:%M")
+    if when.date() == today:
+        return clock
+    if when.date() == today + timedelta(days=1):
+        return f"tomorrow {clock}"
+    return f"{when.strftime('%b')} {when.day} {clock}"
+
+
+def _span(seconds: float) -> str:
+    return f"{seconds / 60:.0f}m" if seconds >= 60 else f"{seconds:.0f}s"
+
+
+# Ticker layout: (stamp, label, text) rows, label column this wide.
+TICKER_LABEL_WIDTH = 9
+
+
+def block_lines(event: "AutoSwitchEvent", stamp: str) -> list[tuple[str, str, str]]:
+    """``(stamp, label, text)`` lines for one event in the labeled-block
+    ticker. The stamp goes on the first row of a block only: rows of events
+    that continue the preceding check's block (decision, next) carry ``""``.
+    Shared by the CLI and the TUI, which only add styling."""
+    lines = []
+    for i, (label, text) in enumerate(event.rows()):
+        first = i == 0 and not event.continues_block
+        lines.append((stamp if first else "", label, text))
+    return lines
+
+
 @dataclass(frozen=True)
 class AutoSwitchEvent:
     """Base event. ``to_json()`` payloads are additive: consumers must ignore
-    unknown ``event`` kinds and unknown fields."""
+    unknown ``event`` kinds and unknown fields.
+
+    The human side is ``rows()`` — ``(label, text)`` pairs for the labeled
+    ticker block — and ``human()``, the same rows on one line (logs,
+    notifications). ``continues_block`` marks events that belong to the
+    preceding check's block (no timestamp of their own)."""
 
     kind: ClassVar[str] = "event"
+    continues_block: ClassVar[bool] = False
     ts: str = field(default_factory=_now_iso, kw_only=True)
 
     def _fields(self) -> dict:
@@ -309,8 +369,11 @@ class AutoSwitchEvent:
             **self._fields(),
         }
 
-    def human(self) -> str:  # pragma: no cover - overridden
-        return self.kind
+    def rows(self) -> list[tuple[str, str]]:  # pragma: no cover - overridden
+        return [(self.kind, self.kind)]
+
+    def human(self) -> str:
+        return "; ".join(text for _label, text in self.rows())
 
 
 @dataclass(frozen=True)
@@ -363,65 +426,82 @@ class PollEvent(AutoSwitchEvent):
             fields["rateHeaders"] = self.rate_headers
         return fields
 
-    def _fetch_text(self) -> str:
-        """`` · fetched #2 (7/h)`` / `` · ⚠ #2 rate-limited …`` suffix."""
-        parts: list[str] = []
-        for num in self.fetched:
-            count = self.requests_last_hour.get(num)
-            per_hour = f" ({count}/h)" if count is not None else ""
-            limited = self.rate_limited.get(num)
-            if limited is not None:
-                after = limited.get("retryAfterS")
-                cause = "429" if after is None else f"429, retry-after {after:.0f}s"
-                until = limited.get("backoffUntil")
-                backing = ""
-                if until:
-                    clock = datetime.fromtimestamp(until).strftime("%H:%M")
-                    backing = f" · backing off until {clock}"
-                parts.append(f"⚠ #{num} rate-limited ({cause}){backing}{per_hour}")
-            else:
-                parts.append(f"fetched #{num}{per_hour}")
-            headers = self.rate_headers.get(num)
-            if headers:
-                shown = ", ".join(f"{k}={v}" for k, v in sorted(headers.items()))
-                parts.append(f"#{num} headers: {shown}")
-        return "".join(f" · {p}" for p in parts)
-
     def _describe(self, num: str) -> str:
+        """``4%`` for one window, ``5h 4%  7d 10%`` for several."""
         wins = self.windows.get(num)
         if wins:
-            return " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+            if len(wins) == 1:
+                return f"{next(iter(wins.values())):.0f}%"
+            return "  ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
         h = self.headroom.get(num)
         if h is not None:
             return f"{100 - h:.0f}%"
         err = self.fetch_errors.get(num)
         return f"? ({err})" if err else "?"
 
-    def human(self) -> str:
+    def _api_rows(self) -> list[tuple[str, str]]:
+        """``polled #2 · 21 requests this hour``, 429s, captured headers."""
+        rows: list[tuple[str, str]] = []
+        plain: list[tuple[str, int | None]] = []
+        for num in self.fetched:
+            count = self.requests_last_hour.get(num)
+            limited = self.rate_limited.get(num)
+            if limited is not None:
+                after = limited.get("retryAfterS")
+                cause = "429" if after is None else f"retry-after {after:.0f}s"
+                until = limited.get("backoffUntil")
+                backing = f", backing off until {_local_clock(until)}" if until else ""
+                per_hour = f" · {count} requests this hour" if count is not None else ""
+                rows.append(
+                    ("api", f"⚠ #{num} rate-limited ({cause}){backing}{per_hour}")
+                )
+            else:
+                plain.append((num, count))
+            headers = self.rate_headers.get(num)
+            if headers:
+                shown = ", ".join(f"{k}={v}" for k, v in sorted(headers.items()))
+                rows.append(("api", f"#{num} headers: {shown}"))
+        if len(plain) == 1:
+            num, count = plain[0]
+            per_hour = f" · {count} requests this hour" if count is not None else ""
+            rows.insert(0, ("api", f"polled #{num}{per_hour}"))
+        elif plain:
+            listed = ", ".join(
+                f"#{n} ({c}/h)" if c is not None else f"#{n}" for n, c in plain
+            )
+            rows.insert(0, ("api", f"polled {listed}"))
+        return rows
+
+    def rows(self) -> list[tuple[str, str]]:
         if self.active is None:
-            return "poll: no active account"
-        num = self.active.get("number")
-        h = self.headroom.get(str(num))
+            return [("active", "no account logged in")]
+        num = str(self.active.get("number"))
+        switch_at = f"(switch at {pct_label(self.threshold)}%)"
+        h = self.headroom.get(num)
         if h is not None:
-            used = f"{100 - h:.0f}% used" + (" (live)" if self.live else "")
+            used = f"{100 - h:.0f}% used {switch_at}" + (" · live" if self.live else "")
         else:
-            err = self.fetch_errors.get(str(num))
-            used = f"usage unknown ({err})" if err else "usage unknown"
-        others = ", ".join(
-            f"#{n}: {self._describe(n)}"
-            for n in self.headroom
-            if n != str(num)
-        )
-        tail = f" | others: {others}" if others else ""
-        return (
-            f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {pct_label(self.threshold)}%){tail}{self._fetch_text()}"
-        )
+            err = self.fetch_errors.get(num)
+            used = f"usage unknown{f' ({err})' if err else ''} {switch_at}"
+        rows = [("active", f"{_ref_text(self.active)}  {used}")]
+        others = [f"#{n} {self._describe(n)}" for n in self.headroom if n != num]
+        if others:
+            rows.append(("others", "   ".join(others)))
+        return rows + self._api_rows()
+
+
+_TRIGGER_TEXT = {
+    "proactive": "reached the switch point",
+    "at-limit": "hit the limit",
+    "failover": "usage unreadable",
+    "consume-first": "resets sooner",
+}
 
 
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
+    continues_block: ClassVar[bool] = True
     trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
     from_ref: dict | None
     to_ref: dict | None
@@ -437,30 +517,55 @@ class SwitchEvent(AutoSwitchEvent):
             "dryRun": self.dry_run,
         }
 
-    def human(self) -> str:
-        src = (
-            f"Account-{self.from_ref.get('number')}" if self.from_ref else "(none)"
-        )
-        dst = (
-            f"Account-{self.to_ref.get('number')} ({self.to_ref.get('email')})"
-            if self.to_ref
-            else "?"
-        )
-        prefix = "[dry-run] would switch" if self.dry_run else "Switched"
-        return f"{prefix} {src} -> {dst} ({self.trigger})"
+    def rows(self) -> list[tuple[str, str]]:
+        verb = "would switch" if self.dry_run else "switched"
+        src = f"#{self.from_ref.get('number')}" if self.from_ref else "(none)"
+        why = _TRIGGER_TEXT.get(self.trigger, self.trigger)
+        return [("decision", f"➜ {verb} {src} → {_ref_text(self.to_ref)} ({why})")]
+
+
+# no-switch reason code → ticker phrase. ``{detail}`` takes the event's
+# detail where it adds information; codes absent here fall back to the code.
+_REASON_TEXT = {
+    "below-threshold": "stay — below the switch point",
+    "already-consuming-soonest": "stay — this account resets soonest",
+    "cooldown": "stay — cooldown after the last switch",
+    "no-candidates": "stay — no other account to switch to",
+    "no-comparison": "stay — no other account's usage is readable",
+    "no-qualifying-candidate": "stay — no account is better by enough",
+    "no-viable-target": "stay — no account can be switched to",
+    "reset-unknown": "stay — the reset time isn't known yet",
+    "already-active": "stay — already on that account",
+    "active-usage-unknown": "wait — usage unknown ({detail})",
+    "active-idle": "wait — token expired while Claude Code is idle",
+    "active-api-key": "skip — API-key account, no quota to watch",
+    "unmanaged-active-account": "skip — logged-in account isn't managed (run 'cswap add')",
+    "no-active-account": "skip — no account logged in",
+}
 
 
 @dataclass(frozen=True)
 class NoSwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "no-switch"
+    continues_block: ClassVar[bool] = True
     reason: str
     detail: str = ""
 
     def _fields(self) -> dict:
         return {"reason": self.reason, "detail": self.detail}
 
-    def human(self) -> str:
-        return f"no switch: {self.reason}" + (f" ({self.detail})" if self.detail else "")
+    def rows(self) -> list[tuple[str, str]]:
+        if self.reason == "stale-usage":
+            # detail: "account 3 usage could not be refreshed this tick ..."
+            words = self.detail.split()
+            num = words[1] if len(words) > 1 and words[0] == "account" else "?"
+            return [("decision", f"wait — refreshing #{num} before switching")]
+        template = _REASON_TEXT.get(self.reason)
+        if template is None:
+            text = f"stay — {self.reason}" + (f": {self.detail}" if self.detail else "")
+        else:
+            text = template.format(detail=self.detail)
+        return [("decision", text)]
 
 
 @dataclass(frozen=True)
@@ -473,12 +578,13 @@ class QuarantineEvent(AutoSwitchEvent):
     def _fields(self) -> dict:
         return {"number": self.number, "email": self.email, "reason": self.reason}
 
-    def human(self) -> str:
-        return (
-            f"Account-{self.number} ({self.email}) quarantined: {self.reason}. "
-            f"Log in with it and run 'cswap --add-account --slot {self.number}' "
-            "to recover."
-        )
+    def rows(self) -> list[tuple[str, str]]:
+        return [(
+            "account",
+            f"⚠ #{self.number} {_short_name(self.email)} quarantined "
+            f"({self.reason}) — log in with it and run "
+            f"'cswap add --slot {self.number}'",
+        )]
 
 
 @dataclass(frozen=True)
@@ -491,27 +597,33 @@ class UnquarantineEvent(AutoSwitchEvent):
     def _fields(self) -> dict:
         return {"number": self.number, "email": self.email, "reason": self.reason}
 
-    def human(self) -> str:
-        return f"Account-{self.number} ({self.email}) back in rotation ({self.reason})"
+    def rows(self) -> list[tuple[str, str]]:
+        return [(
+            "account",
+            f"#{self.number} {_short_name(self.email)} back in rotation ({self.reason})",
+        )]
 
 
 @dataclass(frozen=True)
 class AllExhaustedEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "all-exhausted"
+    continues_block: ClassVar[bool] = True
     earliest_reset_at: str | None
 
     def _fields(self) -> dict:
         return {"earliestResetAt": self.earliest_reset_at}
 
-    def human(self) -> str:
+    def rows(self) -> list[tuple[str, str]]:
         if self.earliest_reset_at:
-            return f"all accounts exhausted; earliest reset {self.earliest_reset_at}"
-        return "all accounts exhausted; no reset time known"
+            when = _local_clock(self.earliest_reset_at)
+            return [("decision", f"stay — every account is used up; first reset {when}")]
+        return [("decision", "stay — every account is used up; no reset time known")]
 
 
 @dataclass(frozen=True)
 class SleepEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "sleep"
+    continues_block: ClassVar[bool] = True
     seconds: float
     until: str
     # Seconds until the soonest usage poll comes due (additive). A wake can
@@ -526,29 +638,21 @@ class SleepEvent(AutoSwitchEvent):
             fields["nextPollInS"] = round(self.next_poll_in_s, 1)
         return fields
 
-    @staticmethod
-    def _span(seconds: float) -> str:
-        return f"{seconds / 60:.0f}m" if seconds >= 60 else f"{seconds:.0f}s"
-
-    def human(self) -> str:
-        try:
-            wake = datetime.fromisoformat(
-                self.until.replace("Z", "+00:00")
-            ).astimezone()
-        except ValueError:
-            return f"next check in {self._span(self.seconds)} ({self.until})"
-        clock = wake.strftime("%H:%M")
+    def rows(self) -> list[tuple[str, str]]:
+        wake = _local_clock(self.until)
         if self.next_poll_in_s is None:
-            return f"next check in {self._span(self.seconds)} ({clock})"
+            return [("next", f"check {wake} (in {_span(self.seconds)})")]
         if self.next_poll_in_s <= self.seconds + 1.0:
-            return f"next usage poll in {self._span(self.seconds)} ({clock})"
-        poll_clock = (
-            wake + timedelta(seconds=self.next_poll_in_s - self.seconds)
-        ).strftime("%H:%M")
-        return (
-            f"next usage poll in {self._span(self.next_poll_in_s)} "
-            f"({poll_clock}) · local check in {self._span(self.seconds)}"
-        )
+            return [("next", f"poll {wake} (in {_span(self.seconds)})")]
+        try:
+            wake_ts = datetime.fromisoformat(self.until.replace("Z", "+00:00")).timestamp()
+            poll = _local_clock(wake_ts + self.next_poll_in_s - self.seconds)
+        except ValueError:
+            poll = f"in {_span(self.next_poll_in_s)}"
+        return [(
+            "next",
+            f"poll {poll} (in {_span(self.next_poll_in_s)}) · local check {wake}",
+        )]
 
 
 @dataclass(frozen=True)
@@ -560,8 +664,8 @@ class ErrorEvent(AutoSwitchEvent):
     def _fields(self) -> dict:
         return {"message": self.message, "transient": self.transient}
 
-    def human(self) -> str:
-        return f"error: {self.message}" + (" (will retry)" if self.transient else "")
+    def rows(self) -> list[tuple[str, str]]:
+        return [("error", self.message + (" — will retry" if self.transient else ""))]
 
 
 @dataclass(frozen=True)
@@ -576,8 +680,8 @@ class ConfigWarningEvent(AutoSwitchEvent):
     def _fields(self) -> dict:
         return {"message": self.message}
 
-    def human(self) -> str:
-        return f"warning: {self.message}"
+    def rows(self) -> list[tuple[str, str]]:
+        return [("warning", self.message)]
 
 
 # ---------------------------------------------------------------------------

@@ -591,6 +591,10 @@ def _limit_hit_summary(events: list) -> str:
         None,
     )
     detail = last.human() if last is not None else "no switch"
+    for prefix in ("stay — ", "wait — ", "skip — "):
+        if detail.startswith(prefix):
+            detail = detail[len(prefix):]
+            break
     return f"cswap: rate limit hit — {detail}"
 
 
@@ -720,7 +724,13 @@ Defaults live in settings.json in the backup root; flags override them.
     if args.limit_hit and not args.once:
         parser.error("--limit-hit can only be used with --once")
 
-    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
+    from claude_swap.autoswitch import (
+        TICKER_LABEL_WIDTH,
+        AutoSwitchEngine,
+        AutoSwitchEvent,
+        block_lines,
+        pct_label,
+    )
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import load_settings, merged_with_cli
 
@@ -728,17 +738,19 @@ Defaults live in settings.json in the backup root; flags override them.
         print(json.dumps(event.to_json()), flush=True)
 
     def human_emit(event: AutoSwitchEvent) -> None:
-        stamp = _time.strftime("%H:%M:%S")
-        line = event.human()
-        if event.kind == "switch":
-            line = accent(line)
-        elif event.kind in ("error", "account-quarantined") or getattr(
-            event, "rate_limited", None
-        ):
-            line = yellowed(line)
-        elif event.kind in ("poll", "no-switch", "sleep"):
-            line = dimmed(line)
-        print(f"{stamp}  {line}", flush=True)
+        # Labeled block per check (block_lines): timestamp on a block's first
+        # row only, a dimmed label column, the row text styled by what it is.
+        for stamp, label, row in block_lines(event, _time.strftime("%H:%M:%S")):
+            if row.startswith("⚠") or event.kind in ("error", "account-quarantined"):
+                styled = yellowed(row)
+            elif event.kind in ("switch", "all-exhausted"):
+                styled = accent(row)
+            elif event.kind == "poll" and label == "active":
+                styled = row
+            else:
+                styled = dimmed(row)
+            label_col = dimmed(f"{label:<{TICKER_LABEL_WIDTH}}")
+            print(f"{stamp:<8}  {label_col} {styled}", flush=True)
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
