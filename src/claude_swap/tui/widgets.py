@@ -363,39 +363,6 @@ class AccountsPanel(Static):
         return text
 
 
-class AccountCard(Static):
-    """One account rendered full-size (used by the switch screen's list)."""
-
-    def __init__(self, acc: AccountSnapshot, *, threshold: float | None = None) -> None:
-        super().__init__()
-        self._acc = acc
-        self._threshold = threshold
-
-    def set_account(self, acc: AccountSnapshot) -> None:
-        self._acc = acc
-        self.refresh(layout=True)
-
-    def render(self) -> Text:
-        return account_card_text(
-            self._acc, self.size.width or 80, threshold=self._threshold,
-            palette=Palette.from_theme(self.app.current_theme),
-        )
-
-
-class AccountItem(ListItem):
-    """ListView row wrapping an :class:`AccountCard`; remembers its slot."""
-
-    def __init__(self, acc: AccountSnapshot) -> None:
-        super().__init__(AccountCard(acc))
-        self.number = acc.number
-        self.email = acc.email
-
-    def set_account(self, acc: AccountSnapshot) -> None:
-        self.number = acc.number
-        self.email = acc.email
-        self.query_one(AccountCard).set_account(acc)
-
-
 class MenuItem(ListItem):
     """One menu row: a label plus an action id the screen dispatches on."""
 

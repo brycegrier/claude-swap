@@ -1145,7 +1145,7 @@ Commands:
   %(prog)s import <path>              import accounts
   %(prog)s import-usage <path>        adopt usage another machine read (list --json)
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
-  %(prog)s watch                      dashboard, opened on the live watch page
+  %(prog)s watch                      same as the dashboard (every account, live)
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
   %(prog)s upgrade                    self-upgrade to latest

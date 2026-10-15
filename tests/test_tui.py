@@ -797,8 +797,7 @@ class TestDashboard:
             menu = app.screen.query_one("#menu", ListView)
             ids = [item.action_id for item in menu.query(MenuItem)]
             assert ids == [
-                "switch",
-                "watch",
+                "switch-menu",
                 "auto",
                 "add-menu",
                 "disable-menu",
@@ -807,15 +806,15 @@ class TestDashboard:
                 "theme-menu",
                 "quit",
             ]
-            # nest into Add (index 3), then back out with escape
-            await pilot.press("down", "down", "down", "enter")
+            # nest into Add (index 2), then back out with escape
+            await pilot.press("down", "down", "enter")
             await pilot.pause()
             ids = [item.action_id for item in menu.query(MenuItem)]
             assert ids == ["add-login", "add-token", "back"]
             await pilot.press("escape")
             await pilot.pause()
             ids = [item.action_id for item in menu.query(MenuItem)]
-            assert ids[0] == "switch"
+            assert ids[0] == "switch-menu"
 
     async def test_remove_menu_shows_alias_before_email(self, tmp_path):
         fake = FakeSwitcher(
@@ -879,7 +878,7 @@ class TestDashboard:
             await menu_select(pilot, "back")
             menu = app.screen.query_one("#menu", ListView)
             ids = [item.action_id for item in menu.query(MenuItem)]
-            assert ids[0] == "switch"
+            assert ids[0] == "switch-menu"
 
     async def test_vim_keys_move_menu_cursor(self, tmp_path):
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
@@ -895,7 +894,16 @@ class TestDashboard:
             await pilot.press("k")
             assert menu.index == 0
 
-    async def test_s_opens_switch_screen_and_enter_switches(self, tmp_path):
+    @staticmethod
+    def _menu_ids(app) -> list[str]:
+        from textual.widgets import ListView
+
+        from claude_swap.tui.widgets import MenuItem
+
+        menu = app.screen.query_one("#menu", ListView)
+        return [item.action_id for item in menu.query(MenuItem)]
+
+    async def test_s_opens_switch_picker_and_enter_switches(self, tmp_path):
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path
         )
@@ -906,21 +914,21 @@ class TestDashboard:
             await pilot.pause()
             from textual.widgets import ListView
 
-            from claude_swap.tui.dashboard import DashboardScreen, SwitchScreen
-            from claude_swap.tui.widgets import AccountItem
+            from claude_swap.tui.dashboard import DashboardScreen
 
-            assert isinstance(app.screen, SwitchScreen)
-            listview = app.screen.query_one("#accounts", ListView)
-            items = list(listview.query(AccountItem))
-            assert [item.number for item in items] == ["1", "2"]
-            assert listview.index == 0  # starts on the active account
+            assert isinstance(app.screen, DashboardScreen)  # a submenu, not a page
+            assert self._menu_ids(app) == [
+                "switch-best", "switch:1", "switch:2", "back",
+            ]
+            menu = app.screen.query_one("#menu", ListView)
+            assert menu.index == 1  # starts on the active account
             await pilot.press("down", "enter")
             await settle(pilot)
             assert ("switch_to", "2") in fake.calls
-            assert isinstance(app.screen, DashboardScreen)  # popped back
+            assert self._menu_ids(app)[0] == "switch-menu"  # back at the root
             assert app.snapshot.active_number == "2"
 
-    async def test_switch_screen_escape_backs_out(self, tmp_path):
+    async def test_switch_picker_escape_backs_out(self, tmp_path):
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path
         )
@@ -929,13 +937,58 @@ class TestDashboard:
             await settle(pilot)
             await pilot.press("enter")  # menu: Switch account…
             await pilot.pause()
-            from claude_swap.tui.dashboard import DashboardScreen, SwitchScreen
-
-            assert isinstance(app.screen, SwitchScreen)
+            assert self._menu_ids(app)[0] == "switch-best"
             await pilot.press("escape")
             await pilot.pause()
-            assert isinstance(app.screen, DashboardScreen)
+            assert self._menu_ids(app)[0] == "switch-menu"
             assert not any(call[0] == "switch_to" for call in fake.calls)
+
+    async def test_switch_picker_best_pick_and_active_row(self, tmp_path):
+        fake = FakeSwitcher(
+            [make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+             make_account(2, entry=make_entry(10.0, 5.0))],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "switch-menu")
+            from textual.widgets import ListView, Static
+
+            from claude_swap.tui.widgets import MenuItem
+
+            menu = app.screen.query_one("#menu", ListView)
+            labels = {
+                item.action_id: item.query_one(Static).render().plain
+                for item in menu.query(MenuItem)
+            }
+            assert labels["switch:1"].startswith("●") and "91% used" in labels["switch:1"]
+            assert "10% used" in labels["switch:2"]
+            # selecting the active account switches nothing
+            await menu_select(pilot, "switch:1")
+            await settle(pilot)
+            assert not any(call[0] == "switch_to" for call in fake.calls)
+            # the best pick runs the "best" strategy
+            await menu_select(pilot, "switch-menu")
+            await menu_select(pilot, "switch-best")
+            await settle(pilot)
+            assert ("switch", "best") in fake.calls
+
+    async def test_menu_title_carries_refresh_status(self, tmp_path):
+        """What the old watch page's title showed: snapshot age, long refresh."""
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            from textual.widgets import Static
+
+            title = app.screen.query_one("#menu-title", Static)
+            assert "snapshot" not in title.render().plain
+            app.snapshot = dataclasses.replace(
+                app.snapshot, taken_at=time.time() - app.SNAPSHOT_AGE_NOTE_S - 1.0
+            )
+            app._update_refresh_status()
+            await pilot.pause()
+            assert "snapshot 1m ago" in title.render().plain
 
     async def test_remove_via_menu_confirms_then_removes(self, tmp_path):
         fake = FakeSwitcher(
@@ -984,7 +1037,7 @@ class TestDashboard:
 
             menu = app.screen.query_one("#menu", ListView)
             ids = [item.action_id for item in menu.query(MenuItem)]
-            assert ids[0] == "switch"
+            assert ids[0] == "switch-menu"
 
     async def test_disable_menu_row_reflects_state_and_re_enables(self, tmp_path):
         fake = FakeSwitcher(
@@ -1094,187 +1147,19 @@ class TestDashboard:
 
 
 @pytest.mark.asyncio
-class TestWatchScreen:
-    def _fake(self, tmp_path):
-        return FakeSwitcher(
-            [make_account(1, active=True), make_account(2)], tmp_path
-        )
+class TestWatchCommand:
+    """`cswap watch` keeps working: it opens the dashboard, which already
+    shows every account live."""
 
-    async def test_w_opens_monitor_without_cursor(self, tmp_path):
-        app = make_app(self._fake(tmp_path))
-        async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
-            await pilot.press("w")
-            await pilot.pause()
-            from textual.widgets import ListView
-
-            from claude_swap.tui.dashboard import WatchScreen
-            from claude_swap.tui.widgets import AccountItem
-
-            assert isinstance(app.screen, WatchScreen)
-            listview = app.screen.query_one("#accounts", ListView)
-            assert len(list(listview.query(AccountItem))) == 2  # full cards
-            assert listview.index is None  # monitor mode: no cursor
-            await pilot.press("enter")  # inert while just watching
-            await settle(pilot)
-            assert not any(call[0] == "switch_to" for call in fake_calls(app))
-
-    async def test_s_arms_selection_switch_stays_watching(self, tmp_path):
-        fake = self._fake(tmp_path)
-        app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
-            await pilot.press("w")
-            await pilot.pause()
-            await pilot.press("s")
-            await pilot.pause()
-            from textual.widgets import ListView
-
-            from claude_swap.tui.dashboard import WatchScreen
-
-            listview = app.screen.query_one("#accounts", ListView)
-            assert listview.index == 0  # cursor armed, on the active account
-            await pilot.press("down", "enter")
-            await settle(pilot)
-            assert ("switch_to", "2") in fake.calls
-            assert isinstance(app.screen, WatchScreen)  # stayed watching
-            assert app.screen.query_one("#accounts", ListView).index is None
-            assert app.snapshot.active_number == "2"
-
-    async def test_escape_disarms_then_leaves(self, tmp_path):
-        fake = self._fake(tmp_path)
-        app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
-            await pilot.press("w")
-            await pilot.pause()
-            await pilot.press("s")
-            await pilot.pause()
-            await pilot.press("escape")  # disarm selection only
-            await pilot.pause()
-            from textual.widgets import ListView
-
-            from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
-
-            assert isinstance(app.screen, WatchScreen)
-            assert app.screen.query_one("#accounts", ListView).index is None
-            await pilot.press("escape")  # now leave
-            await pilot.pause()
-            assert isinstance(app.screen, DashboardScreen)
-            assert not any(call[0] == "switch_to" for call in fake.calls)
-
-    async def test_menu_watch_entry_opens_it(self, tmp_path):
-        app = make_app(self._fake(tmp_path))
-        async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
-            await menu_select(pilot, "watch")
-            from claude_swap.tui.dashboard import WatchScreen
-
-            assert isinstance(app.screen, WatchScreen)
-
-    async def test_app_start_watch_stacks_over_dashboard(self, tmp_path):
+    async def test_start_watch_opens_the_dashboard(self, tmp_path):
         from claude_swap.tui.app import CswapApp
+        from claude_swap.tui.dashboard import DashboardScreen
 
-        app = CswapApp(self._fake(tmp_path), start="watch")
-        async with app.run_test(size=(100, 40)) as pilot:
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = CswapApp(fake, start="watch")
+        async with app.run_test(size=(100, 32)) as pilot:
             await settle(pilot)
-            from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
-
-            assert isinstance(app.screen, WatchScreen)
-            await pilot.press("escape")
-            await pilot.pause()
             assert isinstance(app.screen, DashboardScreen)
-
-    async def test_blocked_normal_allows_store_only_repaint_without_stale_overpaint(
-        self, tmp_path
-    ):
-        normal = make_account(1, active=True, entry=make_usage_at(100.0, pct=10.0))
-        store = make_account(1, active=True, entry=make_usage_at(200.0, pct=80.0))
-        fake = BlockingSnapshotSwitcher(normal, store, tmp_path)
-        app = make_app(fake)
-
-        async with app.run_test(size=(100, 40)) as pilot:
-            await wait_event(fake.normal_started)
-            app._tick()
-            await wait_event(fake.store_done)
-            await pilot.pause()
-            assert app.snapshot.accounts[0].usage.last_good["five_hour"]["pct"] == 80.0
-
-            fake.normal_release.set()
-            await wait_event(fake.normal_done)
-            await pilot.pause()
-            assert app.snapshot.accounts[0].usage.last_good["five_hour"]["pct"] == 80.0
-            assert fake.fetch_sets == [None, set()]
-
-    async def test_late_normal_can_advance_usage_after_store_repaint(self, tmp_path):
-        normal = make_account(1, active=True, entry=make_usage_at(200.0, pct=80.0))
-        store = make_account(1, active=True, entry=make_usage_at(100.0, pct=10.0))
-        fake = BlockingSnapshotSwitcher(normal, store, tmp_path)
-        app = make_app(fake)
-
-        async with app.run_test(size=(100, 40)) as pilot:
-            await wait_event(fake.normal_started)
-            app._tick()
-            await wait_event(fake.store_done)
-            await pilot.pause()
-            assert app.snapshot.accounts[0].usage.last_good["five_hour"]["pct"] == 10.0
-
-            fake.normal_release.set()
-            await wait_event(fake.normal_done)
-            await pilot.pause()
-            assert app.snapshot.accounts[0].usage.last_good["five_hour"]["pct"] == 80.0
-
-    async def test_repeated_ticks_keep_store_lane_single_flight(self, tmp_path):
-        normal = make_account(1, active=True, entry=make_usage_at(100.0, pct=10.0))
-        store = make_account(1, active=True, entry=make_usage_at(200.0, pct=80.0))
-        fake = BlockingSnapshotSwitcher(normal, store, tmp_path)
-        fake.block_store = True
-        app = make_app(fake)
-
-        async with app.run_test(size=(100, 40)):
-            await wait_event(fake.normal_started)
-            app._tick()
-            await wait_event(fake.store_started)
-            app._tick()
-            app._tick()
-            assert fake.fetch_sets == [None, set()]
-            fake.store_release.set()
-            fake.normal_release.set()
-            await wait_event(fake.store_done)
-            await wait_event(fake.normal_done)
-
-    async def test_store_only_mode_launches_only_store_lane(self, tmp_path):
-        fake = self._fake(tmp_path)
-        app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
-            fake.fetch_sets.clear()
-            app.set_store_only(True)
-            await settle(pilot)
-            assert fake.fetch_sets == [set()]
-
-    async def test_watch_title_shows_snapshot_age_and_long_refresh(self, tmp_path):
-        app = make_app(self._fake(tmp_path))
-        async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
-            await pilot.press("w")
-            await pilot.pause()
-            from textual.widgets import Static
-
-            title = app.screen.query_one("#list-title", Static)
-            # Fresh snapshots stay quiet; the age note is a staleness alarm.
-            assert "snapshot" not in title.render().plain
-            app.snapshot = dataclasses.replace(
-                app.snapshot, taken_at=time.time() - app.SNAPSHOT_AGE_NOTE_S - 1.0
-            )
-            app._update_refresh_status()
-            await pilot.pause()
-            assert "snapshot 1m ago" in title.render().plain
-            app._normal_refreshing = True
-            app._normal_started_at = time.time() - app.POLL_INTERVAL_S - 1.0
-            app._update_refresh_status()
-            await pilot.pause()
-            assert "refreshing" in title.render().plain
 
 
 def fake_calls(app) -> list[tuple]:

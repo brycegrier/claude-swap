@@ -17,8 +17,8 @@ if TYPE_CHECKING:
 def run(switcher: "ClaudeAccountSwitcher", start: str = "dashboard") -> int:
     """Run the TUI over an existing switcher. Returns the process exit code.
 
-    ``start="watch"`` (the ``cswap watch`` command) opens directly on the
-    live watch page, stacked over the dashboard.
+    ``start="watch"`` (the ``cswap watch`` command) is accepted for
+    compatibility and opens the dashboard, which shows every account live.
     """
     from claude_swap.appearance import detect_terminal_background, drain_stdin
     from claude_swap.tui.app import CswapApp
