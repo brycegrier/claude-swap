@@ -53,7 +53,13 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.live_feed import LiveReading, live_usage_path, read_live_usage
+from claude_swap.live_feed import (
+    FEED_FRESH_S,
+    FEED_HOLD_S,
+    LiveReading,
+    live_usage_path,
+    read_live_usage,
+)
 from claude_swap.usage_store import due_at, due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
@@ -328,6 +334,10 @@ def _local_clock(value: float | str | None) -> str:
     return f"{when.strftime('%b')} {when.day} {clock}"
 
 
+def _requests(count: int) -> str:
+    return f"{count} request" if count == 1 else f"{count} requests"
+
+
 def _span(seconds: float) -> str:
     return f"{seconds / 60:.0f}m" if seconds >= 60 else f"{seconds:.0f}s"
 
@@ -404,6 +414,9 @@ class PollEvent(AutoSwitchEvent):
     # The active account's reading came from Claude Code's status-line feed
     # (live, free) rather than the usage endpoint. Additive.
     live: bool = False
+    # How old that status-line reading is (it is held past "live" as a lower
+    # bound until its window resets). Additive.
+    live_age_s: float | None = None
     requests_last_hour: dict[str, int] = field(default_factory=dict)
     rate_limited: dict[str, dict] = field(default_factory=dict)
     rate_headers: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -423,6 +436,8 @@ class PollEvent(AutoSwitchEvent):
             fields["windowsPct"] = self.windows
         if self.live:
             fields["live"] = True
+            if self.live_age_s is not None:
+                fields["liveAgeS"] = round(self.live_age_s, 1)
         if self.fetched:
             fields["fetched"] = list(self.fetched)
         if self.requests_last_hour:
@@ -448,6 +463,15 @@ class PollEvent(AutoSwitchEvent):
         err = self.fetch_errors.get(num)
         return f"? ({err})" if err else "?"
 
+    def _live_text(self) -> str:
+        """`` · live``, or `` · live 4m ago`` once the reading is held."""
+        if not self.live:
+            return ""
+        age = self.live_age_s
+        if age is None or age <= FEED_FRESH_S:
+            return " · live"
+        return f" · live {_span(age)} ago"
+
     def _api_rows(self) -> list[tuple[str, str]]:
         """``polled #2 · 21 requests this hour``, 429s, captured headers."""
         rows: list[tuple[str, str]] = []
@@ -460,7 +484,7 @@ class PollEvent(AutoSwitchEvent):
                 cause = "429" if after is None else f"retry-after {after:.0f}s"
                 until = limited.get("backoffUntil")
                 backing = f", backing off until {_local_clock(until)}" if until else ""
-                per_hour = f" · {count} requests this hour" if count is not None else ""
+                per_hour = f" · {_requests(count)} this hour" if count is not None else ""
                 rows.append(
                     ("api", f"⚠ #{num} rate-limited ({cause}){backing}{per_hour}")
                 )
@@ -472,7 +496,7 @@ class PollEvent(AutoSwitchEvent):
                 rows.append(("api", f"#{num} headers: {shown}"))
         if len(plain) == 1:
             num, count = plain[0]
-            per_hour = f" · {count} requests this hour" if count is not None else ""
+            per_hour = f" · {_requests(count)} this hour" if count is not None else ""
             rows.insert(0, ("api", f"polled #{num}{per_hour}"))
         elif plain:
             listed = ", ".join(
@@ -488,7 +512,7 @@ class PollEvent(AutoSwitchEvent):
         switch_at = f"(switch at {pct_label(self.threshold)}%)"
         h = self.headroom.get(num)
         if h is not None:
-            used = f"{100 - h:.0f}% used {switch_at}" + (" · live" if self.live else "")
+            used = f"{100 - h:.0f}% used {switch_at}" + self._live_text()
         else:
             err = self.fetch_errors.get(num)
             used = f"usage unknown{f' ({err})' if err else ''} {switch_at}"
@@ -947,6 +971,7 @@ class AutoSwitchEngine:
         # stretched active plan), and when the active account last changed
         # (feed attribution).
         self._live_reading: LiveReading | None = None
+        self._live_age_s: float | None = None
         self._live_used = False
         self._feed_live = False
         self._active_seen: str | None = None
@@ -1286,6 +1311,7 @@ class AutoSwitchEngine:
                 headroom=headroom,
                 threshold=settings.threshold,
                 live=self._live_used,
+                live_age_s=self._live_age_s if self._live_used else None,
                 **fetch_report,
                 fetch_errors={
                     num: entry.last_error
@@ -2748,8 +2774,13 @@ class AutoSwitchEngine:
                 self._active_since_ts = self.clock()
             self._active_seen = current
         reading = None
+        now = None
         if self.settings.live_feed and live_usage_path(self.switcher.backup_dir).exists():
-            reading = read_live_usage(self.switcher.backup_dir, self.clock())
+            now = self.clock()
+            # Held up to FEED_HOLD_S: an older reading still beats an older
+            # API one (usage only rises until a reset, which read_live_usage
+            # checks); "live" below still needs a FEED_FRESH_S-recent one.
+            reading = read_live_usage(self.switcher.backup_dir, now, fresh_s=FEED_HOLD_S)
         if reading is not None:
             changed = [
                 t for t in (state.get("lastSwitchAt"), self._active_since_ts)
@@ -2758,7 +2789,8 @@ class AutoSwitchEngine:
             if changed and reading.written_at < max(changed) + FEED_ATTRIBUTION_GRACE_S:
                 reading = None  # still the previous account's numbers
         self._live_reading = reading
-        live = reading is not None
+        live = reading is not None and now - reading.written_at <= FEED_FRESH_S
+        self._live_age_s = None if reading is None else max(now - reading.written_at, 0.0)
         if live != self._feed_live:
             self._feed_live = live
             self._pin_poll_inputs()

@@ -31,10 +31,15 @@ from pathlib import Path
 
 LIVE_USAGE_FILENAME = "live-usage.json"
 
-# A reading older than this is ignored. The status line only refreshes while
-# Claude Code is producing messages; an idle session burns nothing, and a
-# stale feed simply hands the active account back to API polling.
+# A reading this recent means the feed is LIVE: Claude Code is producing
+# messages, so the engine re-reads every 10s and lets the active account's
+# API polls relax. The status line only refreshes on new messages.
 FEED_FRESH_S = 90.0
+
+# An older reading is still a valid lower bound — usage only rises within a
+# window — until one of its windows resets, so the engine keeps deciding on
+# it (instead of falling back to an older API reading) for up to this long.
+FEED_HOLD_S = 3600.0
 
 _WINDOWS = (("five_hour", "five_hour"), ("seven_day", "seven_day"))
 
@@ -108,4 +113,18 @@ def read_live_usage(
     usage = parse_rate_limits(raw.get("rate_limits"))
     if not usage:
         return None
+    if any(
+        _reset_passed(window.get("resets_at"), now) for window in usage.values()
+    ):
+        return None  # a window rolled over since: the reading is obsolete
     return LiveReading(written_at=written, usage=usage)
+
+
+def _reset_passed(resets_at: str | None, now: float) -> bool:
+    if not resets_at:
+        return False
+    try:
+        ts = datetime.fromisoformat(resets_at.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return False
+    return ts <= now

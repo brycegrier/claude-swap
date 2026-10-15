@@ -7183,11 +7183,38 @@ class TestLiveFeed:
         sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "proactive"
 
-    def test_a_stale_feed_is_ignored(self, harness):
+    def test_an_older_reading_is_held_as_a_lower_bound(self, harness):
+        # 200s old: no longer "live" (no 10s wake, no relaxed API plan), but
+        # still newer than the 300s-old API reading, and usage only rises
+        # within a window — so it still decides.
         self._feed(harness, 95, age=200)
         outcome = harness.tick_with_entries(self._stored(harness, self._usage3(50)))
+        assert outcome is TickOutcome.SWITCHED
+        assert not harness.engine._feed_live
+        poll = next(e for e in harness.events if isinstance(e, PollEvent))
+        assert poll.live and "· live 3m ago" in poll.human()
+
+    def test_a_reading_past_the_hold_is_ignored(self, harness):
+        from claude_swap.live_feed import FEED_HOLD_S
+
+        self._feed(harness, 95, age=FEED_HOLD_S + 1)
+        outcome = harness.tick_with_entries(
+            self._stored(harness, self._usage3(50), age=FEED_HOLD_S + 60)
+        )
         assert outcome is TickOutcome.NO_ACTION
         assert not next(e for e in harness.events if isinstance(e, PollEvent)).live
+
+    def test_a_reading_whose_window_reset_since_is_ignored(self, harness):
+        from claude_swap.live_feed import live_usage_path
+
+        live_usage_path(harness.switcher.backup_dir).write_text(json.dumps({
+            "writtenAt": harness.clock.now - 120,
+            "rate_limits": {"five_hour": {
+                "used_percentage": 95, "resets_at": harness.clock.now - 30,
+            }},
+        }))
+        outcome = harness.tick_with_entries(self._stored(harness, self._usage3(50)))
+        assert outcome is TickOutcome.NO_ACTION
 
     def test_a_newer_api_reading_wins_over_the_feed(self, harness):
         self._feed(harness, 95, age=30)
