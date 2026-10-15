@@ -151,7 +151,7 @@ ConfirmModal, AddTokenModal, OutputModal {
     margin-top: 1;
 }
 
-/* Flat chip buttons: quiet at rest, terracotta block when focused. ←/→ move
+/* Flat chip buttons: quiet at rest, accent block when focused. ←/→ move
    focus between them, Enter presses — the accent shows where Enter lands. */
 .modal-buttons Button {
     border: none;

@@ -733,7 +733,7 @@ def _deterministic_colour(monkeypatch):
     stdout is captured and every assertion on plain output then breaks.
     Measured with ``FORCE_COLOR=3`` exported: 11 failures in test_switcher.py
     reading ``assert 'Skipping Account-2 (disabled)' in
-    '\\x1b[38;5;173mSkipping\\x1b[0m Account-2 (disabled)'``, and the same
+    '\\x1b[38;2;157;177;255mSkipping\\x1b[0m Account-2 (disabled)'``, and the same
     tree green with the variable unset.
 
     Scrubbing the variables is not enough on its own, because detection

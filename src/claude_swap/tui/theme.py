@@ -1,11 +1,11 @@
-"""The "cswap-dark" Textual theme and shared color constants.
+"""The "cswap-dark" / "cswap-light" Textual themes and shared colors.
 
-A subtle modern dark theme: neutral charcoal backgrounds in the VS Code
-register, one warm terracotta accent (the same xterm-173 tone printer.py has
-always used for the CLI — a deliberate nod to Claude Code's orange, used
-sparingly), and desaturated severity colors so usage bars read calmly on a
-dark background. Deliberately *not* a wholesale copy of any other tool's
-palette.
+"Signal": cool slate neutrals, a periwinkle accent kept apart from the
+usage colors, and a blue → gold → vermilion severity ramp drawn from the
+Okabe–Ito colorblind-safe set. No red/green pairing: each step also changes
+lightness, so the bars read with any color vision. Every text color meets
+WCAG AA (≥ 4.5:1) on both the background and the panel (the worst-case row
+background) in each theme.
 """
 
 from __future__ import annotations
@@ -17,18 +17,18 @@ from textual.theme import Theme
 
 # Core palette (single source of truth — widgets import these for rich
 # renderables, the Theme below maps them onto Textual's design tokens).
-ACCENT = "#d7875f"  # warm terracotta (xterm 173)
-FOREGROUND = "#e8e4de"  # soft, slightly warm off-white
-MUTED = "#8a8a8a"  # secondary text
-BACKGROUND = "#141414"
-SURFACE = "#1e1e1e"
-PANEL = "#262626"
+ACCENT = "#9db1ff"  # periwinkle
+FOREGROUND = "#e3e7ee"  # cool off-white
+MUTED = "#8b95a5"  # secondary text (slate)
+BACKGROUND = "#13161c"
+SURFACE = "#1b1f27"
+PANEL = "#232a35"
 
-# Usage severity ramp (desaturated for dark backgrounds).
-SEV_OK = "#87af87"  # calm green: plenty of headroom
-SEV_WARN = "#d7af5f"  # amber: climbing (>= 70%)
-SEV_CRIT = "#d75f5f"  # soft red: near the limit (>= 90%)
-TRACK = "#3a3a3a"  # unfilled bar track
+# Usage severity ramp — blue, gold, vermilion (Okabe–Ito family).
+SEV_OK = "#56b4e9"  # sky blue: plenty of headroom
+SEV_WARN = "#f0c43c"  # gold: climbing (>= 70%)
+SEV_CRIT = "#ee7438"  # vermilion: near the limit (>= 90%)
+TRACK = "#2f3744"  # unfilled bar track
 
 # Severity band edges. WARN mirrors where a user starts caring; CRIT mirrors
 # the auto-switch default threshold so bar color and switch behavior agree.
@@ -101,17 +101,19 @@ CSWAP_DARK = Theme(
     },
 )
 
-# Light companion palette (same intent, tuned for a warm near-white base).
-ACCENT_LIGHT = "#954c2a"  # burnt sienna — deepened for AA on panel (worst-case row bg)
-FOREGROUND_LIGHT = "#2b2723"
-MUTED_LIGHT = "#635d55"
-BACKGROUND_LIGHT = "#faf7f2"
-SURFACE_LIGHT = "#efeae1"
-PANEL_LIGHT = "#e2dbcf"  # most-elevated = darkest (inverted from dark)
-SEV_OK_LIGHT = "#3d6b3d"  # forest green — deepened for AA on panel
-SEV_WARN_LIGHT = "#795911"  # deep ochre — deepened for AA on panel
-SEV_CRIT_LIGHT = "#ad3128"  # brick red — deepened for AA on panel
-TRACK_LIGHT = "#cec7ba"
+# Light companion palette (same intent on a cool near-white base). The
+# severity colors are deepened so text meets AA on the panel (worst-case
+# row background).
+ACCENT_LIGHT = "#3d55c4"  # deep periwinkle
+FOREGROUND_LIGHT = "#1e2430"
+MUTED_LIGHT = "#566072"
+BACKGROUND_LIGHT = "#f6f8fb"
+SURFACE_LIGHT = "#eaeef4"
+PANEL_LIGHT = "#dfe5ee"  # most-elevated = darkest (inverted from dark)
+SEV_OK_LIGHT = "#1a6496"  # deep blue
+SEV_WARN_LIGHT = "#7f5800"  # deep gold
+SEV_CRIT_LIGHT = "#a63d0c"  # deep vermilion
+TRACK_LIGHT = "#c9d1dd"
 
 CSWAP_LIGHT = Theme(
     name="cswap-light",

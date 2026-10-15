@@ -69,14 +69,14 @@ class TestStyling:
         monkeypatch.setenv("FORCE_COLOR", "1")
         result = printer.accent("hello")
         assert "hello" in result
-        assert "\033[38;5;173m" in result
+        assert "\033[38;2;157;177;255m" in result
         assert "\033[0m" in result
 
     def test_muted_with_colors_enabled(self, monkeypatch):
         monkeypatch.delenv("NO_COLOR", raising=False)
         monkeypatch.setenv("FORCE_COLOR", "1")
         result = printer.muted("org name")
-        assert "\033[38;5;250m" in result
+        assert "\033[38;2;139;149;165m" in result
         assert "org name" in result
 
     def test_dimmed_with_colors_enabled(self, monkeypatch):
@@ -98,7 +98,7 @@ class TestStyling:
         monkeypatch.setenv("FORCE_COLOR", "1")
         result = printer.bold_accent("(active)")
         assert "\033[1m" in result
-        assert "\033[38;5;173m" in result
+        assert "\033[38;2;157;177;255m" in result
         assert "(active)" in result
 
 
@@ -110,9 +110,9 @@ class TestThemePalette:
         monkeypatch.setenv("FORCE_COLOR", "1")
         printer._colors_enabled = None
         printer.set_theme("light")
-        assert "38;2;149;76;42" in printer.accent("x")   # #954c2a
+        assert "38;2;61;85;196" in printer.accent("x")   # #3d55c4
         printer.set_theme("dark")
-        assert "38;5;173" in printer.accent("x")
+        assert "38;2;157;177;255" in printer.accent("x")
 
     def test_light_theme_error_uses_light_red(self, monkeypatch, capsys):
         monkeypatch.delenv("NO_COLOR", raising=False)
@@ -120,14 +120,14 @@ class TestThemePalette:
         printer._colors_enabled = None
         printer.set_theme("light")
         printer.error("boom")
-        assert "38;2;173;49;40" in capsys.readouterr().err   # #ad3128
+        assert "38;2;166;61;12" in capsys.readouterr().err   # #a63d0c
 
     def test_unknown_theme_falls_back_to_dark(self, monkeypatch):
         monkeypatch.delenv("NO_COLOR", raising=False)
         monkeypatch.setenv("FORCE_COLOR", "1")
         printer._colors_enabled = None
         printer.set_theme("bogus")
-        assert "38;5;173" in printer.accent("x")
+        assert "38;2;157;177;255" in printer.accent("x")
 
 
 class TestLinePrinters:
@@ -145,7 +145,7 @@ class TestLinePrinters:
         monkeypatch.setenv("FORCE_COLOR", "1")
         printer.error("something failed")
         captured = capsys.readouterr()
-        assert "\033[31m" in captured.err
+        assert "\033[38;2;238;116;56m" in captured.err  # vermilion
 
     def test_warning_prints_to_stdout(self, monkeypatch, capsys):
         monkeypatch.setenv("NO_COLOR", "1")
@@ -158,7 +158,7 @@ class TestLinePrinters:
         monkeypatch.setenv("FORCE_COLOR", "1")
         printer.warning("be careful")
         captured = capsys.readouterr()
-        assert "\033[33m" in captured.out
+        assert "\033[38;2;240;196;60m" in captured.out  # gold
 
 
 def test_force_color_overrides_and_restores():
@@ -168,7 +168,7 @@ def test_force_color_overrides_and_restores():
         printer._colors_enabled = False
         with printer.force_color():
             assert printer.colors_enabled() is True
-            assert printer.accent("X") == "\x1b[38;5;173mX\x1b[0m"
+            assert printer.accent("X") == "\x1b[38;2;157;177;255mX\x1b[0m"
         assert printer._colors_enabled is False
     finally:
         printer._colors_enabled = saved

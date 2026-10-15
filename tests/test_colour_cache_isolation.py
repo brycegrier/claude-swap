@@ -62,7 +62,7 @@ def test_a_test_may_latch_the_theme(monkeypatch):
     monkeypatch.setenv("FORCE_COLOR", "1")
     printer._colors_enabled = None
     printer.set_theme("light")
-    assert "38;2;149;76;42" in printer.accent("x")   # premise: light is live
+    assert "38;2;61;85;196" in printer.accent("x")   # premise: light is live
 
 
 def test_the_next_test_is_not_themed_by_it(monkeypatch):
@@ -85,7 +85,7 @@ def test_the_next_test_is_not_themed_by_it(monkeypatch):
     """
     monkeypatch.setenv("FORCE_COLOR", "1")
     printer._colors_enabled = None
-    assert "38;5;173" in printer.accent("x"), (
+    assert "38;2;157;177;255" in printer.accent("x"), (
         "the previous test's light theme outlived it"
     )
 
