@@ -111,14 +111,16 @@ FAST_POLL_BURST = 6
 CANDIDATE_DEFAULT_INTERVAL_S = 300.0
 CANDIDATE_MAX_INTERVAL_S = 600.0
 
-# Exhaustion is stable enough to poll slowly, but not to stop polling until a
-# reported reset. Quota grants and provider-side corrections can make an
-# account usable before that timestamp, and decision-grade status must not age
-# into "unavailable" while the scheduler is deliberately waiting. Ten-minute
-# polling (six requests/hour) stays below the measured budget and
-# detects recovery promptly; a nearer reported reset still pulls the next poll
-# forward.
+# An exhausted account with a known reset is PARKED until that reset (+
+# slack): usage cannot fall before its window rolls over, and the reset time
+# is already known, so probing in between spends budget to learn nothing.
+# Its stored reading stays decision-trusted until the reset (usage_store), so
+# it keeps reading as exhausted, not unknown. The trade: an early provider-
+# side quota grant goes unnoticed until the advertised reset. Only when no
+# reset is known does it fall back to a bounded ten-minute probe. A reset
+# farther out than PARK_MAX_S is treated as malformed and not parked on.
 EXHAUSTED_INTERVAL_S = 600.0
+PARK_MAX_S = 8 * 86400.0
 
 # A window whose binding pct moved at least this much between polls is being
 # consumed somewhere (this machine, another PC, session mode) → tighten; an
@@ -175,9 +177,14 @@ class PollInputs:
     burn_pct_per_min: float = ASSUMED_BURN_PCT_PER_MIN
     min_interval_s: float = ACTIVE_MIN_INTERVAL_S
     far_interval_s: float = ACTIVE_FAR_INTERVAL_S
+    # Claude Code's status-line feed is live for the active account (see
+    # live_feed): its API poll is only a cross-check, so it waits the max.
+    feed_live: bool = False
 
     @classmethod
-    def from_settings(cls, settings, models: tuple[str, ...]) -> "PollInputs":
+    def from_settings(
+        cls, settings, models: tuple[str, ...], *, feed_live: bool = False
+    ) -> "PollInputs":
         """From an ``AutoSwitchSettings`` (duck-typed: no settings import)."""
         return cls(
             threshold=settings.threshold,
@@ -185,6 +192,7 @@ class PollInputs:
             burn_pct_per_min=settings.poll_assumed_burn_pct_per_min,
             min_interval_s=settings.poll_min_interval_seconds,
             far_interval_s=settings.poll_max_interval_seconds,
+            feed_live=feed_live,
         )
 
     def ramp_kwargs(self) -> dict:
@@ -274,6 +282,21 @@ def next_token_at(fetch_log: tuple[float, ...] | list[float]) -> float | None:
     return last + (1.0 - tokens) * MIN_INTERVAL_S
 
 
+def parked_until(
+    usage: dict | None, now: float, models: tuple[str, ...] = ()
+) -> float | None:
+    """When an exhausted account's blocking windows have all rolled over
+    (+ ``RESET_SLACK_S``), or None if it isn't exhausted, the reset is
+    unknown/past, or implausibly far out (``PARK_MAX_S``)."""
+    headroom = oauth.account_headroom(usage, models)
+    if headroom is None or headroom > 0:
+        return None
+    reset_ts = limiting_reset_ts(usage, models)
+    if reset_ts is None or reset_ts <= now or reset_ts - now > PARK_MAX_S:
+        return None
+    return reset_ts + RESET_SLACK_S
+
+
 def parse_reset_ts(resets_at: str | None) -> float | None:
     if not resets_at:
         return None
@@ -300,6 +323,7 @@ def plan_after_fetch(
     min_interval_s: float = ACTIVE_MIN_INTERVAL_S,
     far_interval_s: float = ACTIVE_FAR_INTERVAL_S,
     fetch_log: tuple[float, ...] | None = None,
+    feed_live: bool = False,
 ) -> tuple[float, float]:
     """``(next_poll_at, interval_s)`` for an account just fetched successfully.
 
@@ -327,7 +351,12 @@ def plan_after_fetch(
         and new_pct is not None
         and abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT
     )
-    if is_active:
+    if is_active and feed_live:
+        # The status-line feed reports this account live and free; the API
+        # poll is a cross-check, so it waits the longest and keeps the bucket
+        # full for when the feed goes quiet.
+        interval = far_interval_s
+    elif is_active:
         # Points left decide, not movement or the previous interval.
         interval = active_interval_for(
             new_pct,
@@ -355,9 +384,14 @@ def plan_after_fetch(
 
     headroom = oauth.account_headroom(new_usage, models)
     if headroom is not None and headroom <= 0:
-        # Keep probing exhausted accounts: Anthropic can grant/reset quota
-        # before the previously advertised timestamp. Preserve a wider
-        # post-429 interval if congestion control already selected one.
+        parked = parked_until(new_usage, now, models)
+        if parked is not None:
+            # 60-120s past the reset, spread so machines don't hit it at once.
+            # The interval matches the deadline, so the store's obsolete-plan
+            # guard (a far deadline beside a short interval) never fires.
+            next_poll = parked + RESET_SLACK_S * rng()
+            return next_poll, next_poll - now
+        # No reset known: a bounded probe, keeping any wider post-429 interval.
         interval = max(interval, EXHAUSTED_INTERVAL_S)
 
     next_poll = now + interval * (1.0 + JITTER_FRAC * (2.0 * rng() - 1.0))

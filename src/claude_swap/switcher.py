@@ -5222,6 +5222,7 @@ class ClaudeAccountSwitcher:
                     t for t in (before.fetch_log if before else ())
                     if now - 3600.0 < t <= now
                 ) + (now,),
+                feed_live=inputs.feed_live,
                 **inputs.ramp_kwargs(),
             )
         return plans

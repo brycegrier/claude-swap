@@ -1059,7 +1059,8 @@ class TestAutoCommand:
         tick_outcome = None  # set per test (TickOutcome)
 
         def __init__(self, switcher, settings, on_event, *, dry_run=False,
-                     state_path=None, clock=None):
+                     state_path=None, clock=None, assume_active_exhausted=False):
+            self.assume_active_exhausted = assume_active_exhausted
             self.switcher = switcher
             self.settings = settings
             self.on_event = on_event
@@ -1156,6 +1157,13 @@ class TestAutoCommand:
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
         assert excinfo.value.code == 2
+
+    def test_limit_hit_requires_once(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "auto", "--limit-hit"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--limit-hit can only be used with --once" in capsys.readouterr().err
 
     def test_auto_help(self, capsys):
         with patch.object(sys, "argv", ["claude-swap", "auto", "--help"]):

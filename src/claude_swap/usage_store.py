@@ -44,6 +44,7 @@ from claude_swap.poll_policy import (
     RECENT_429_WINDOW_S,
     RESET_SLACK_S,
     SERVE_TTL_S,
+    parked_until,
     parse_reset_ts,
 )
 from claude_swap.settings import atomic_write_json
@@ -1002,6 +1003,14 @@ class UsageStore:
                 )
             else:
                 within_ceiling = age_s is not None and age_s <= TRUST_MAX_AGE_S
+            # An exhausted reading holds until its blocking window resets
+            # (usage cannot fall before then): the planner parks the row until
+            # that moment, and the account must read as exhausted, not
+            # unknown, while it waits.
+            if not within_ceiling and parked_until(
+                last_good if isinstance(last_good, dict) else None, now, models
+            ) is not None:
+                within_ceiling = True
             live_claim = _live_claim(claim_until, last_attempt_at, now)
             # A live hold is deliberate staleness as well: another machine
             # polls this account and hands its readings over, so between two

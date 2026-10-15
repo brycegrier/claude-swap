@@ -897,9 +897,18 @@ class TestAdaptiveScheduler:
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
         assert counts["1"] == 1
-        for _ in range(3):
-            h.clock.advance(400)
+        # Parked: the reset is known and usage can't fall before it, so no
+        # probes in between — and the reading stays trusted (exhausted, not
+        # unknown) the whole time.
+        for _ in range(17):
+            h.clock.advance(400)  # up to t6800, short of the 7200s reset
             self._tick(h, counts, usage)
+        assert counts["1"] == 1
+        assert h.engine._unhealthy_ticks == 0
+        # Past the whole parked window (reset + 60-120s, randomly spread so
+        # machines don't all hit the reset at once).
+        h.clock.advance(400 + 2 * poll_policy.RESET_SLACK_S + 1)
+        self._tick(h, counts, usage)
         assert counts["1"] == 2
 
     def test_engine_repairs_legacy_reset_parked_active_plan(
@@ -927,8 +936,13 @@ class TestAdaptiveScheduler:
         entry = h.switcher._usage_store.entries(
             {"1": ("a@example.com", "")}
         )["1"]
+        # Repaired into a CONSISTENT park: deadline just past the reset,
+        # interval matching it (not the legacy short one).
         assert entry.next_poll_at is not None
-        assert entry.next_poll_at < reset_ts
+        assert reset_ts < entry.next_poll_at <= reset_ts + 2 * poll_policy.RESET_SLACK_S
+        assert entry.poll_interval_s == pytest.approx(
+            entry.next_poll_at - h.clock.now
+        )
 
     def test_band_jump_is_seen_at_most_one_poll_late(
         self, temp_home, monkeypatch
@@ -7125,3 +7139,167 @@ class TestRateLimitVisibility:
             f"next usage poll in 10m ({poll_at}) · local check in 5m"
         )
         assert capped.to_json()["nextPollInS"] == 600.0
+
+
+class TestLiveFeed:
+    """Claude Code's status-line feed as a free, live reading of the active
+    account (see live_feed)."""
+
+    @staticmethod
+    def _feed(h, pct: float, *, age: float = 0.0) -> None:
+        from claude_swap.live_feed import live_usage_path
+
+        live_usage_path(h.switcher.backup_dir).write_text(json.dumps({
+            "writtenAt": h.clock.now - age,
+            "rate_limits": {"five_hour": {"used_percentage": pct}},
+        }))
+
+    @staticmethod
+    def _stored(h, usage: dict, *, age: float = 300.0) -> dict:
+        """Entries whose API readings are ``age`` seconds old."""
+        now = h.clock.now
+        return {
+            num: UsageEntry(last_good=value, fetched_at=now - age, age_s=age)
+            for num, value in usage.items()
+        }
+
+    def _usage3(self, active: float) -> dict:
+        return {"1": _usage(active), "2": _usage(10), "3": _usage(10)}
+
+    def test_a_fresh_feed_over_the_threshold_switches(self, harness):
+        self._feed(harness, 95)  # API still says 50%
+        outcome = harness.tick_with_entries(self._stored(harness, self._usage3(50)))
+        assert outcome is TickOutcome.SWITCHED
+        poll = next(e for e in harness.events if isinstance(e, PollEvent))
+        assert poll.live and "95% used (live)" in poll.human()
+        sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_a_stale_feed_is_ignored(self, harness):
+        self._feed(harness, 95, age=200)
+        outcome = harness.tick_with_entries(self._stored(harness, self._usage3(50)))
+        assert outcome is TickOutcome.NO_ACTION
+        assert not next(e for e in harness.events if isinstance(e, PollEvent)).live
+
+    def test_a_newer_api_reading_wins_over_the_feed(self, harness):
+        self._feed(harness, 95, age=30)
+        outcome = harness.tick_with_entries(
+            self._stored(harness, self._usage3(50), age=5)
+        )
+        assert outcome is TickOutcome.NO_ACTION
+
+    def test_a_reading_from_before_the_last_switch_is_not_attributed(self, harness):
+        # Right after a switch the status line still shows the old account.
+        harness.switcher.backup_dir.joinpath("autoswitch_state.json").write_text(
+            json.dumps({"schemaVersion": 1, "lastSwitchAt": harness.clock.now - 2})
+        )
+        self._feed(harness, 95, age=3)
+        harness.tick_with_entries(self._stored(harness, self._usage3(50)))
+        assert not next(e for e in harness.events if isinstance(e, PollEvent)).live
+
+    def test_the_setting_turns_it_off(self, temp_home):
+        h = EngineHarness(temp_home, live_feed=False)
+        for n, e in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            h.seed(n, e)
+        h.make_live("a@example.com", 1)
+        self._feed(h, 95)
+        assert h.tick_with_entries(self._stored(h, self._usage3(50))) is (
+            TickOutcome.NO_ACTION
+        )
+
+    def test_live_feed_wakes_the_loop_every_ten_seconds(self, harness):
+        self._feed(harness, 40)
+        harness.tick_with_entries(self._stored(harness, self._usage3(50)))
+        assert harness.engine._feed_live
+        TestLoopObeysThePollPlan._plan_all(harness, active_due_in=900.0, others_due_in=900.0)
+        assert harness.engine._next_delay(TickOutcome.NO_ACTION) == (
+            autoswitch.FEED_CHECK_S
+        )
+
+    def test_unchanged_feed_ticks_are_silent(self, harness):
+        self._feed(harness, 40)
+        entries = self._stored(harness, self._usage3(50))
+        harness.tick_with_entries(entries)
+        first = len(harness.events)
+        assert first > 0
+        harness.clock.advance(10)
+        self._feed(harness, 40)  # rewritten, same numbers
+        harness.tick_with_entries(entries)
+        assert len(harness.events) == first  # nothing new to say
+        self._feed(harness, 41)
+        harness.tick_with_entries(entries)
+        assert len(harness.events) > first   # a change prints again
+
+    def test_live_feed_stretches_the_active_api_plan(self, harness):
+        self._feed(harness, 40)
+        harness.tick_with_entries(self._stored(harness, self._usage3(50)))
+        pinned = harness.switcher._poll_inputs_override
+        assert pinned.feed_live is True
+        _, interval = poll_policy.plan_after_fetch(
+            prev_interval_s=None, prev_usage=None, new_usage=_usage(96),
+            is_active=True, threshold=99.0, models=(), recent_429=False,
+            now=0.0, rng=lambda: 0.5, feed_live=True,
+        )
+        assert interval == poll_policy.ACTIVE_FAR_INTERVAL_S
+
+
+class TestLimitHit:
+    """`cswap auto --once --limit-hit` from Claude Code's StopFailure hook."""
+
+    def _engine(self, harness):
+        return harness._make_engine(assume_active_exhausted=True)
+
+    def test_switches_at_limit_without_fetching_the_active(self, harness):
+        harness.engine = self._engine(harness)
+        fetch_sets: list[set] = []
+        entries = {
+            "1": _entry_for(_usage(31), harness.clock.now),
+            "2": _entry_for(_usage(10), harness.clock.now),
+            "3": _entry_for(_usage(50), harness.clock.now),
+        }
+
+        def collect(*args, **kwargs):
+            fetch_sets.append(set(kwargs.get("fetch") or ()))
+            return entries
+
+        with patch.object(harness.switcher, "usage_entries_by_account", side_effect=collect):
+            outcome = harness.engine.tick()
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+        assert all("1" not in s for s in fetch_sets)  # never polled the active
+        assert entries["1"].last_good == _usage(31)  # nothing written back
+
+    def test_ignores_cooldown(self, harness):
+        harness.switcher.backup_dir.joinpath("autoswitch_state.json").write_text(
+            json.dumps({"schemaVersion": 1, "lastSwitchAt": harness.clock.now - 10})
+        )
+        harness.engine = self._engine(harness)
+        outcome = harness.tick_with_usage(
+            {"1": _usage(31), "2": _usage(10), "3": _usage(50)}
+        )
+        assert outcome is TickOutcome.SWITCHED
+
+    def test_blocked_when_no_account_has_room(self, harness):
+        harness.engine = self._engine(harness)
+        outcome = harness.tick_with_usage(
+            {"1": _usage(31), "2": _usage(100), "3": _usage(100)}
+        )
+        assert outcome is TickOutcome.BLOCKED
+        assert harness.active_number() == 1
+
+    def test_summary_line(self):
+        from claude_swap.cli import _limit_hit_summary
+
+        sw = SwitchEvent(
+            trigger="at-limit",
+            from_ref={"number": 1, "email": "a@x.com"},
+            to_ref={"number": 2, "email": "b@x.com"},
+        )
+        assert _limit_hit_summary([sw]) == (
+            "cswap: rate limit hit on #1 — switched to #2 (b@x.com). "
+            "Send 'continue' to resume."
+        )
+        nope = NoSwitchEvent(reason="no-candidates")
+        assert _limit_hit_summary([nope]).startswith("cswap: rate limit hit — ")

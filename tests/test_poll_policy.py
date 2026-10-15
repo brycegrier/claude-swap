@@ -277,6 +277,12 @@ class TestPost429Aimd:
         assert max(poll_policy.CANDIDATE_MAX_INTERVAL_S, poll_policy.ACTIVE_FAR_INTERVAL_S) < poll_policy.POST_429_MAX_INTERVAL_S
 
 
+def poll_policy_plan_oversleeps(next_poll: float, interval: float) -> bool:
+    from claude_swap.usage_store import _plan_oversleeps_interval
+
+    return _plan_oversleeps_interval(next_poll, interval, NOW)
+
+
 class TestResetCapping:
     def _iso(self, ts: float) -> str:
         return (
@@ -291,18 +297,26 @@ class TestResetCapping:
         assert next_poll == pytest.approx(reset_ts + poll_policy.RESET_SLACK_S)
         assert interval == poll_policy.CANDIDATE_DEFAULT_INTERVAL_S
 
-    def test_at_limit_keeps_bounded_polling_before_distant_reset(self):
+    def test_at_limit_parks_until_its_reset(self):
+        # Usage cannot fall before the reset, and the reset is known: no
+        # probes in between. The interval matches the deadline, so the
+        # store's obsolete-plan guard never mistakes the park for a bug.
         reset_ts = NOW + 7_200.0
+        next_poll, interval = _plan(new_usage=_usage(100, self._iso(reset_ts)))
+        assert next_poll == pytest.approx(reset_ts + poll_policy.RESET_SLACK_S * 1.5)
+        assert interval == pytest.approx(next_poll - NOW)
+        assert not poll_policy_plan_oversleeps(next_poll, interval)
+
+    def test_at_limit_parks_on_an_imminent_reset_too(self):
+        reset_ts = NOW + 90.0
+        next_poll, interval = _plan(new_usage=_usage(100, self._iso(reset_ts)))
+        assert next_poll == pytest.approx(reset_ts + poll_policy.RESET_SLACK_S * 1.5)
+
+    def test_an_implausibly_distant_reset_is_not_parked_on(self):
+        reset_ts = NOW + poll_policy.PARK_MAX_S + 3600.0
         next_poll, interval = _plan(new_usage=_usage(100, self._iso(reset_ts)))
         assert interval == poll_policy.EXHAUSTED_INTERVAL_S
         assert next_poll == pytest.approx(NOW + interval)
-        assert next_poll < reset_ts
-
-    def test_at_limit_poll_is_pulled_to_an_imminent_reset(self):
-        reset_ts = NOW + 90.0
-        next_poll, interval = _plan(new_usage=_usage(100, self._iso(reset_ts)))
-        assert interval == poll_policy.EXHAUSTED_INTERVAL_S
-        assert next_poll == pytest.approx(reset_ts + poll_policy.RESET_SLACK_S)
 
     @pytest.mark.parametrize("reset_ts", [NOW - 90.0, NOW])
     def test_at_limit_ignores_non_future_reset(self, reset_ts):
@@ -310,13 +324,12 @@ class TestResetCapping:
         assert interval == poll_policy.EXHAUSTED_INTERVAL_S
         assert next_poll == pytest.approx(NOW + interval)
 
-    def test_active_at_limit_uses_same_bounded_recovery_probe(self):
+    def test_active_at_limit_parks_the_same_way(self):
         reset_ts = NOW + 7_200.0
         next_poll, interval = _plan(
             new_usage=_usage(100, self._iso(reset_ts)), is_active=True
         )
-        assert interval == poll_policy.EXHAUSTED_INTERVAL_S
-        assert next_poll == pytest.approx(NOW + interval)
+        assert next_poll == pytest.approx(reset_ts + poll_policy.RESET_SLACK_S * 1.5)
 
 
 class TestJitter:

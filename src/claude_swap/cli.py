@@ -575,6 +575,25 @@ Examples:
         sys.exit(130)
 
 
+def _limit_hit_summary(events: list) -> str:
+    """One line for a Claude Code hook to show after a rate-limit failure."""
+    switch = next((e for e in events if e.kind == "switch"), None)
+    if switch is not None:
+        frm = (switch.from_ref or {}).get("number", "?")
+        to = switch.to_ref or {}
+        verb = "would switch" if getattr(switch, "dry_run", False) else "switched"
+        return (
+            f"cswap: rate limit hit on #{frm} — {verb} to #{to.get('number')} "
+            f"({to.get('email', '')}). Send 'continue' to resume."
+        )
+    last = next(
+        (e for e in reversed(events) if e.kind in ("all-exhausted", "no-switch", "error")),
+        None,
+    )
+    detail = last.human() if last is not None else "no switch"
+    return f"cswap: rate limit hit — {detail}"
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -618,6 +637,15 @@ Defaults live in settings.json in the backup root; flags override them.
         "--once",
         action="store_true",
         help="Evaluate once, maybe switch, and exit (exit code = outcome)",
+    )
+    parser.add_argument(
+        "--limit-hit",
+        action="store_true",
+        help=(
+            "With --once: a request just failed on a rate limit (Claude "
+            "Code's StopFailure hook) — treat the active account as exhausted "
+            "without polling it and switch to the best account with room"
+        ),
     )
     parser.add_argument(
         "--json",
@@ -689,6 +717,8 @@ Defaults live in settings.json in the backup root; flags override them.
         help="Enable debug logging",
     )
     args = parser.parse_args(argv)
+    if args.limit_hit and not args.once:
+        parser.error("--limit-hit can only be used with --once")
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
     from claude_swap.printer import accent, yellowed
@@ -718,15 +748,33 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        limit_events: list[AutoSwitchEvent] = []
+
+        def limit_hit_emit(event: AutoSwitchEvent) -> None:
+            # Runs inside a Claude Code hook: the log gets every event, the
+            # user one line (below).
+            switcher._logger.info("limit-hit: %s", event.human())
+            limit_events.append(event)
+
+        if args.json:
+            emit = jsonl_emit
+        elif args.limit_hit:
+            emit = limit_hit_emit
+        else:
+            emit = human_emit
         engine = AutoSwitchEngine(
             switcher,
             settings,
-            jsonl_emit if args.json else human_emit,
+            emit,
             dry_run=args.dry_run,
+            assume_active_exhausted=args.limit_hit,
         )
 
         if args.once:
-            sys.exit(engine.tick().value)
+            outcome = engine.tick()
+            if args.limit_hit and not args.json:
+                print(_limit_hit_summary(limit_events), flush=True)
+            sys.exit(outcome.value)
 
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())

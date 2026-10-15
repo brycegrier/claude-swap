@@ -53,6 +53,7 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.live_feed import LiveReading, live_usage_path, read_live_usage
 from claude_swap.usage_store import due_at, due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
@@ -100,6 +101,13 @@ NO_RESET_FALLBACK_S = 300.0
 MIN_LOOP_SLEEP_S = 5.0
 # Only sleeps longer than this get a SleepEvent ("next check …") line.
 SLEEP_EVENT_MIN_S = 60.0
+# While Claude Code's status-line feed is live the loop re-reads it this
+# often — a local file read, no API request.
+FEED_CHECK_S = 10.0
+# A feed reading counts for the active account only if written at least this
+# long after that account became active: right after a switch, Claude Code's
+# status line still shows the previous account until its next response.
+FEED_ATTRIBUTION_GRACE_S = 5.0
 
 # Idle-hold cap (elapsed, not ticks — the hold itself slows the cadence to
 # NO_RESET_FALLBACK_S): an owned-and-expired token normally means Claude Code
@@ -326,6 +334,9 @@ class PollEvent(AutoSwitchEvent):
     # tick as {"retryAfterS", "backoffUntil"}; and any rate-limit-like
     # response headers the endpoint sent.
     fetched: tuple[str, ...] = ()
+    # The active account's reading came from Claude Code's status-line feed
+    # (live, free) rather than the usage endpoint. Additive.
+    live: bool = False
     requests_last_hour: dict[str, int] = field(default_factory=dict)
     rate_limited: dict[str, dict] = field(default_factory=dict)
     rate_headers: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -340,6 +351,8 @@ class PollEvent(AutoSwitchEvent):
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
             fields["windowsPct"] = self.windows
+        if self.live:
+            fields["live"] = True
         if self.fetched:
             fields["fetched"] = list(self.fetched)
         if self.requests_last_hour:
@@ -390,7 +403,7 @@ class PollEvent(AutoSwitchEvent):
         num = self.active.get("number")
         h = self.headroom.get(str(num))
         if h is not None:
-            used = f"{100 - h:.0f}% used"
+            used = f"{100 - h:.0f}% used" + (" (live)" if self.live else "")
         else:
             err = self.fetch_errors.get(str(num))
             used = f"usage unknown ({err})" if err else "usage unknown"
@@ -781,9 +794,28 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        assume_active_exhausted: bool = False,
     ):
         self.switcher = switcher
         self.settings = settings
+        # `cswap auto --once --limit-hit` (Claude Code's StopFailure hook): a
+        # request just failed on a rate limit, which is fresher proof than
+        # any poll — treat the active account as exhausted without fetching
+        # it, for this engine's ticks only (never written to the store).
+        self.assume_active_exhausted = assume_active_exhausted
+        # Status-line feed state (see live_feed): this tick's attributable
+        # reading, whether the feed is live (drives the 10s wake and the
+        # stretched active plan), and when the active account last changed
+        # (feed attribution).
+        self._live_reading: LiveReading | None = None
+        self._live_used = False
+        self._feed_live = False
+        self._active_seen: str | None = None
+        self._active_since_ts: float | None = None
+        # Quiet log: events of the tick in flight, and the last flushed
+        # batch's text so identical feed-check ticks print nothing.
+        self._tick_events: list | None = None
+        self._last_batch_key: tuple | None = None
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
         # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
@@ -1020,6 +1052,14 @@ class AutoSwitchEngine:
 
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
+        self._tick_events = []
+        try:
+            return self._tick_body()
+        finally:
+            events, self._tick_events = self._tick_events, None
+            self._flush(events)
+
+    def _tick_body(self) -> TickOutcome:
         try:
             return self._tick_inner()
         except ClaudeSwitchError as e:
@@ -1030,6 +1070,24 @@ class AutoSwitchEngine:
                 ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
             )
             return TickOutcome.ERROR
+
+    def _flush(self, events: list) -> None:
+        """Deliver a tick's events — unless it was a feed-check tick that
+        changed nothing: with the feed live the loop ticks every 10s, and a
+        repeat of the last poll/no-switch lines is noise, not news."""
+        key = tuple(e.human() for e in events)
+        quiet = (
+            self._feed_live
+            and events
+            and all(e.kind in ("poll", "no-switch") for e in events)
+            and not any(getattr(e, "fetched", ()) for e in events)
+            and key == self._last_batch_key
+        )
+        self._last_batch_key = key
+        if quiet:
+            return
+        for event in events:
+            self.on_event(event)
 
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
@@ -1071,6 +1129,7 @@ class AutoSwitchEngine:
                 )
             return TickOutcome.NO_ACTION
 
+        self._refresh_live_reading(current, state)
         current_email = self.switcher.account_email(current)
         active_ref = _ref(current, current_email) if current_email else {
             "number": int(current),
@@ -1087,6 +1146,7 @@ class AutoSwitchEngine:
                 active=active_ref,
                 headroom=headroom,
                 threshold=settings.threshold,
+                live=self._live_used,
                 **fetch_report,
                 fetch_errors={
                     num: entry.last_error
@@ -1352,6 +1412,7 @@ class AutoSwitchEngine:
                 fetch={current, *candidates}
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
+            self._overlay_active(current, entries, usage)
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
@@ -2181,7 +2242,11 @@ class AutoSwitchEngine:
             if active_pre is not None
             else None
         )
-        active_cap = max(
+        active_cap = (
+            self.settings.poll_max_interval_seconds
+            if self._feed_live
+            else None
+        ) or max(
             poll_policy.MIN_INTERVAL_S,
             poll_policy.active_interval_for(
                 active_pre_pct,
@@ -2217,6 +2282,8 @@ class AutoSwitchEngine:
             )
         ):
             plan.add(current)
+        if self.assume_active_exhausted:
+            plan.discard(current)  # the failed request already measured it
         if self._idle_hold_since is None:
             pick = due_candidate(candidates, pre, now)
             if pick is not None:
@@ -2229,6 +2296,7 @@ class AutoSwitchEngine:
             scheduled=not stale_candidate_plan,
         )
         usage = {num: entry.decision_value() for num, entry in entries.items()}
+        self._overlay_active(current, entries, usage)
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
@@ -2247,6 +2315,8 @@ class AutoSwitchEngine:
         )
         if escalate:
             escalation_fetch = {current, *candidates}
+            if self.assume_active_exhausted:
+                escalation_fetch.discard(current)
             # Escalation may beat ordinary candidate plans to obtain a fresh
             # switch decision, but a decision-trusted exhausted row cannot be
             # a target. Preserve any wider post-429 plan instead of refetching
@@ -2271,6 +2341,7 @@ class AutoSwitchEngine:
                 fetch=escalation_fetch
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
+            self._overlay_active(current, entries, usage)
 
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
@@ -2446,7 +2517,10 @@ class AutoSwitchEngine:
         return datetime.fromtimestamp(earliest, tz=timezone.utc)
 
     def _emit(self, event: AutoSwitchEvent) -> None:
-        self.on_event(event)
+        if self._tick_events is not None:
+            self._tick_events.append(event)  # flushed when the tick ends
+        else:
+            self.on_event(event)
 
     # -- loop -------------------------------------------------------------------
 
@@ -2467,9 +2541,77 @@ class AutoSwitchEngine:
         state) are fixed at construction. The frozen-settings swap is atomic
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
+        self._pin_poll_inputs()
+
+    def _pin_poll_inputs(self) -> None:
         self.switcher.set_poll_policy_inputs(
-            poll_policy.PollInputs.from_settings(self.settings, self._models)
+            poll_policy.PollInputs.from_settings(
+                self.settings, self._models, feed_live=self._feed_live
+            )
         )
+
+    # -- live feed -------------------------------------------------------------
+
+    def _refresh_live_reading(self, current: str, state: dict) -> None:
+        """Read Claude Code's status-line feed for this tick, keeping it only
+        when it can be attributed to ``current``: written after the active
+        account last changed (the engine's own switch, ``lastSwitchAt``, or a
+        change it observed between ticks) plus FEED_ATTRIBUTION_GRACE_S."""
+        # The clock is read only when needed (an observed account change, or
+        # a feed file to judge): ticks without a feed keep their exact
+        # clock-read sequence.
+        if current != self._active_seen:
+            if self._active_seen is not None:
+                self._active_since_ts = self.clock()
+            self._active_seen = current
+        reading = None
+        if self.settings.live_feed and live_usage_path(self.switcher.backup_dir).exists():
+            reading = read_live_usage(self.switcher.backup_dir, self.clock())
+        if reading is not None:
+            changed = [
+                t for t in (state.get("lastSwitchAt"), self._active_since_ts)
+                if isinstance(t, (int, float))
+            ]
+            if changed and reading.written_at < max(changed) + FEED_ATTRIBUTION_GRACE_S:
+                reading = None  # still the previous account's numbers
+        self._live_reading = reading
+        live = reading is not None
+        if live != self._feed_live:
+            self._feed_live = live
+            self._pin_poll_inputs()
+
+    def _overlay_active(
+        self, current: str, entries: dict, usage: dict[str, dict | str | None]
+    ) -> None:
+        """Put this tick's best knowledge of the active account into
+        ``usage`` (decision values only — the store is never written):
+
+        - under ``assume_active_exhausted``, an exhausted 5h window;
+        - else a live feed reading newer than the stored fetch, merged over
+          the stored windows (the feed carries 5h/7d only, so per-model
+          scoped windows keep coming from the API row).
+        """
+        self._live_used = False
+        stored = usage.get(current)
+        base = dict(stored) if isinstance(stored, dict) else {}
+        if self.assume_active_exhausted:
+            five = dict(base.get("five_hour") or {})
+            if self._live_reading is not None:
+                five.update(self._live_reading.usage.get("five_hour") or {})
+            five["pct"] = 100.0
+            base["five_hour"] = five
+            usage[current] = base
+            return
+        reading = self._live_reading
+        if reading is None:
+            return
+        entry = entries.get(current)
+        fetched_at = getattr(entry, "fetched_at", None)
+        if fetched_at is not None and fetched_at >= reading.written_at:
+            return  # the API reading is the newer one
+        base.update(reading.usage)
+        usage[current] = base
+        self._live_used = True
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         self._next_poll_in_s = None  # set by _until_next_due when known
@@ -2540,6 +2682,8 @@ class AutoSwitchEngine:
         if polls:
             self._next_poll_in_s = max(min(polls) - now, 0.0)
         deadlines.extend(polls)
+        if self._feed_live:
+            deadlines.append(now + FEED_CHECK_S)  # local re-read, no request
         if not deadlines:
             return cap
         return min(cap, max(min(deadlines) - now, MIN_LOOP_SLEEP_S))

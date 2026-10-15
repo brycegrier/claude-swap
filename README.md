@@ -99,7 +99,8 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
 - **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted. `consume-first-5h` does the same keyed to the **5-hour window** — for when the 5h limit, not the weekly one, is what you hit first.
-- Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
+- Usage polling is adaptive and budgeted. The usage endpoint allows roughly 28–30 requests per hour per account. The active account waits in proportion to the room it has left (about 10s per point before the threshold, between 30s and 15 min), capped by a per-account request bucket at 26/hour. Exhausted accounts are parked until their reset instead of being probed. `cswap auto` sleeps until a poll is actually due, and the ticker shows each account's requests per hour plus any rate limiting.
+- With the [live feed](#live-usage-from-the-claude-code-status-line) set up, the active account is read for free from Claude Code's own status line. It's checked every 10s while Claude is working, and switches happen the moment it crosses the threshold.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
 - An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
 - To hold an account out of rotation yourself — a work account you don't want touched, one you're resting — run `cswap disable <num|email>`; `cswap enable <num|email>` puts it back. Disabled accounts are skipped by auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies, but stay fully managed and remain a valid explicit `cswap switch <num|email>` target. They show a `(disabled)` marker in `cswap list`, in the [TUI](#interactive-dashboard-tui), and in the [menu bar](#menu-bar-macos) — both of which also let you toggle the state in place (TUI: menu → *Disable / enable account…*; menu bar: *Disable / enable account*).
@@ -115,6 +116,46 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 Defaults like the threshold and cooldown are configurable with `cswap config set autoswitch.threshold 80` — flags override them (see [Configuration](#configuration)).
 
 </details>
+
+### Live usage from the Claude Code status line
+
+On every new assistant message, Claude Code passes its status-line command a JSON object. For claude.ai Pro/Max logins it includes `rate_limits` (5h/7d `used_percentage` and `resets_at`), read from the rate-limit headers of its own API responses. If your status-line script writes that to `live-usage.json` in the cswap data directory, `cswap auto` uses it as a free, live reading of the active account. It checks the file every 10s while it's fresh (≤ 90s old), switches the moment it crosses the threshold, and lets the active account's API polls relax to the max interval. A reading only counts if it was written after the active account last changed, because right after a switch the status line still shows the previous account. Turn it off with `cswap config set autoswitch.liveFeed false`.
+
+PowerShell (`statusline.ps1`, after reading stdin into `$j`):
+
+```powershell
+if ($j.rate_limits) {
+    $dir = Join-Path $HOME ".claude-swap-backup"   # your cswap data directory
+    $tmp = Join-Path $dir "live-usage.json.tmp"
+    @{ writtenAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0; rate_limits = $j.rate_limits } |
+        ConvertTo-Json -Depth 5 -Compress | Set-Content -Path $tmp -Encoding utf8
+    Move-Item -Force $tmp (Join-Path $dir "live-usage.json")
+}
+```
+
+bash (with `input=$(cat)` at the top of the script):
+
+```bash
+dir=~/.claude-swap-backup   # your cswap data directory
+live=$(echo "$input" | jq -c 'select(.rate_limits) | {writtenAt: now, rate_limits}')
+[ -n "$live" ] && echo "$live" > "$dir/live-usage.json.tmp" \
+  && mv "$dir/live-usage.json.tmp" "$dir/live-usage.json"
+```
+
+### Instant failover when a request hits the limit
+
+Add a `StopFailure` hook to `~/.claude/settings.json`. The moment a turn fails on a rate limit, it switches to the best account with room left, without waiting for the next poll:
+
+```json
+"hooks": {
+  "StopFailure": [
+    { "matcher": "rate_limit",
+      "hooks": [ { "type": "command", "command": "cswap auto --once --limit-hit" } ] }
+  ]
+}
+```
+
+`--limit-hit` treats the active account as exhausted without polling it, since the failed request already proved it. Claude Code picks up the new credentials on the next request, so send `continue` to resume.
 
 ### Run multiple accounts at the same time (session mode)
 

@@ -78,6 +78,9 @@ class AutoSwitchSettings:
     poll_assumed_burn_pct_per_min: float = 3.0
     poll_min_interval_seconds: float = 30.0
     poll_max_interval_seconds: float = 900.0
+    # Use the live reading Claude Code's status line writes to
+    # <backup_root>/live-usage.json (see live_feed) for the active account.
+    live_feed: bool = True
 
 
 @dataclass(frozen=True)
@@ -174,6 +177,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "autoswitch", "pollMaxIntervalSeconds", "poll_max_interval_seconds",
             "float", 180.0, 3600.0,
             help="Longest wait between usage polls (lots of room left)",
+        ),
+        SettingSpec(
+            "autoswitch", "liveFeed", "live_feed", "bool",
+            help="Use Claude Code's status-line usage (live-usage.json) when it's fresh",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
