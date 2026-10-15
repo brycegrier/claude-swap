@@ -7327,8 +7327,31 @@ class TestTickerRows:
         ]
         decision = NoSwitchEvent(reason="already-consuming-soonest", detail="x")
         assert autoswitch.block_lines(decision, "09:36:48") == [
-            ("", "decision", "stay — this account resets soonest")
+            ("", "decision", "stay — no account with room left resets sooner")
         ]
+
+    def test_exhausted_others_show_when_they_reset(self):
+        iso = "2026-10-15T05:19:00Z"
+        poll = PollEvent(
+            active={"number": 1, "email": "b@x.edu"},
+            headroom={"1": 48.0, "2": 0.0}, threshold=99.0,
+            reset_at={"2": iso},
+        )
+        assert dict(poll.rows())["others"] == (
+            f"#2 100% (resets {autoswitch._local_clock(iso)})"
+        )
+        assert poll.to_json()["resetAt"] == {"2": iso}
+
+    def test_tick_reports_exhausted_reset_times(self, harness):
+        from datetime import datetime as _dt, timezone as _tz
+
+        reset = _dt.fromtimestamp(harness.clock.now + 7200, tz=_tz.utc)
+        iso = reset.isoformat(timespec="seconds").replace("+00:00", "Z")
+        harness.tick_with_usage({
+            "1": _usage(50), "2": _usage(100, iso), "3": _usage(10),
+        })
+        poll = next(e for e in harness.events if isinstance(e, PollEvent))
+        assert poll.reset_at == {"2": iso}
 
     def test_every_reason_code_has_a_phrase(self):
         for code in autoswitch._REASON_TEXT:

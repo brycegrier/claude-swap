@@ -403,6 +403,9 @@ class PollEvent(AutoSwitchEvent):
     requests_last_hour: dict[str, int] = field(default_factory=dict)
     rate_limited: dict[str, dict] = field(default_factory=dict)
     rate_headers: dict[str, dict[str, str]] = field(default_factory=dict)
+    # account number → ISO time an exhausted account's blocking window(s)
+    # reset, so "100%" reads with when it comes back. Additive.
+    reset_at: dict[str, str] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         fields = {
@@ -424,6 +427,8 @@ class PollEvent(AutoSwitchEvent):
             fields["rateLimited"] = self.rate_limited
         if self.rate_headers:
             fields["rateHeaders"] = self.rate_headers
+        if self.reset_at:
+            fields["resetAt"] = self.reset_at
         return fields
 
     def _describe(self, num: str) -> str:
@@ -484,7 +489,12 @@ class PollEvent(AutoSwitchEvent):
             err = self.fetch_errors.get(num)
             used = f"usage unknown{f' ({err})' if err else ''} {switch_at}"
         rows = [("active", f"{_ref_text(self.active)}  {used}")]
-        others = [f"#{n} {self._describe(n)}" for n in self.headroom if n != num]
+        others = [
+            f"#{n} {self._describe(n)}"
+            + (f" (resets {_local_clock(self.reset_at[n])})" if n in self.reset_at else "")
+            for n in self.headroom
+            if n != num
+        ]
         if others:
             rows.append(("others", "   ".join(others)))
         return rows + self._api_rows()
@@ -528,7 +538,7 @@ class SwitchEvent(AutoSwitchEvent):
 # detail where it adds information; codes absent here fall back to the code.
 _REASON_TEXT = {
     "below-threshold": "stay — below the switch point",
-    "already-consuming-soonest": "stay — this account resets soonest",
+    "already-consuming-soonest": "stay — no account with room left resets sooner",
     "cooldown": "stay — cooldown after the last switch",
     "no-candidates": "stay — no other account to switch to",
     "no-comparison": "stay — no other account's usage is readable",
@@ -863,6 +873,25 @@ def _fetch_report(pre: dict, post: dict) -> dict:
         "rate_limited": limited,
         "rate_headers": headers,
     }
+
+
+def _exhausted_resets(
+    usage: dict, headroom: dict[str, float | None], models: tuple[str, ...]
+) -> dict[str, str]:
+    """ISO reset time of each exhausted account's blocking window(s)."""
+    out: dict[str, str] = {}
+    for num, value in usage.items():
+        h = headroom.get(num)
+        if h is None or h > 0 or not isinstance(value, dict):
+            continue
+        ts = _limiting_reset_ts(value, models)
+        if ts is not None:
+            out[num] = (
+                datetime.fromtimestamp(ts, tz=timezone.utc)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z")
+            )
+    return out
 
 
 def _ref(number: str, email: str) -> dict:
@@ -1264,6 +1293,7 @@ class AutoSwitchEngine:
                         value if isinstance(value, dict) else None, self._models
                     ))
                 },
+                reset_at=_exhausted_resets(usage, headroom, self._models),
             )
         )
 
