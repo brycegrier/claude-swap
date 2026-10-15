@@ -582,6 +582,18 @@ def _limit_hit_summary(events: list) -> str:
         frm = (switch.from_ref or {}).get("number", "?")
         to = switch.to_ref or {}
         verb = "would switch" if getattr(switch, "dry_run", False) else "switched"
+        if switch.trigger == "soonest-reset":
+            # Nothing has room: continuing now would fail again. Say when the
+            # account we moved to comes back.
+            from claude_swap.autoswitch import _local_clock
+
+            poll = next((e for e in events if e.kind == "poll"), None)
+            back = (getattr(poll, "reset_at", {}) or {}).get(str(to.get("number")))
+            when = f" at {_local_clock(back)}" if back else ""
+            return (
+                f"cswap: every account is used up — {verb} to #{to.get('number')} "
+                f"({to.get('email', '')}), which resets first{when}."
+            )
         return (
             f"cswap: rate limit hit on #{frm} — {verb} to #{to.get('number')} "
             f"({to.get('email', '')}). Send 'continue' to resume."

@@ -47,6 +47,9 @@ def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
         maxBytes=1024 * 1024,  # 1MB
         backupCount=3,
         delay=True,
+        # Explicit: the platform default (cp1252 on Windows) cannot encode
+        # glyphs the ticker logs (→ ➜ ⚠), and a failed emit drops the line.
+        encoding="utf-8",
     )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(

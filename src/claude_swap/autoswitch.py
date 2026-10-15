@@ -99,6 +99,10 @@ NO_RESET_FALLBACK_S = 300.0
 # The loop sleeps until the next poll is due; never tighter than this, so an
 # overdue row the collector refuses (lock contention, store hiccup) can't spin.
 MIN_LOOP_SLEEP_S = 5.0
+# When every account is used up, only move to the one that resets first if
+# it beats the active account's own reset by at least this much — a switch
+# for a few seconds' head start is churn, not help.
+SOONEST_RESET_MARGIN_S = 120.0
 # Only sleeps longer than this get a SleepEvent ("next check …") line.
 SLEEP_EVENT_MIN_S = 60.0
 # While Claude Code's status-line feed is live the loop re-reads it this
@@ -505,6 +509,7 @@ _TRIGGER_TEXT = {
     "at-limit": "hit the limit",
     "failover": "usage unreadable",
     "consume-first": "resets sooner",
+    "soonest-reset": "everything is used up; this one resets first",
 }
 
 
@@ -512,7 +517,8 @@ _TRIGGER_TEXT = {
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
     continues_block: ClassVar[bool] = True
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    # "proactive" | "at-limit" | "failover" | "consume-first" | "soonest-reset"
+    trigger: str
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -1635,20 +1641,35 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
-            self._blocked_wait_long = True
-            earliest = self._earliest_recovery(usage)
-            if earliest is not None:
-                self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
-            self._emit(
-                AllExhaustedEvent(
-                    earliest_reset_at=(
-                        earliest.isoformat().replace("+00:00", "Z")
-                        if earliest
-                        else None
+            # Everything is used up. If the active account is too, sit on the
+            # account that comes back FIRST: when it resets, Claude Code's next
+            # request already goes out on it instead of failing until the
+            # engine notices the reset. Never while the active account still
+            # has room — that would throw away its last points.
+            target = (
+                self._soonest_reset_target(current, oauth_candidates, usage)
+                if settings.exhausted_switch_to_soonest
+                and active_headroom is not None
+                and active_headroom <= 0
+                else None
+            )
+            if target is None:
+                self._blocked_wait_long = True
+                earliest = self._earliest_recovery(usage)
+                if earliest is not None:
+                    self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
+                self._emit(
+                    AllExhaustedEvent(
+                        earliest_reset_at=(
+                            earliest.isoformat().replace("+00:00", "Z")
+                            if earliest
+                            else None
+                        )
                     )
                 )
-            )
-            return TickOutcome.BLOCKED
+                return TickOutcome.BLOCKED
+            ordered = [target]
+            trigger = "soonest-reset"
 
         # -- freshen + switch ----------------------------------------------
         # The departure snapshot of the account we are leaving, taken from the
@@ -2557,6 +2578,34 @@ class AutoSwitchEngine:
         return TickOutcome.SWITCHED
 
     # -- helpers --------------------------------------------------------------
+
+    def _soonest_reset_target(
+        self,
+        current: str,
+        candidates: list[str],
+        usage: dict[str, dict | str | None],
+    ) -> str | None:
+        """The exhausted candidate that becomes usable first, if it does so
+        meaningfully (SOONEST_RESET_MARGIN_S) before the active account, else
+        None. Usable again = every blocking window has reset
+        (``limiting_reset_ts``); an unknown reset never wins."""
+
+        def back_at(num: str) -> float | None:
+            value = usage.get(num)
+            return (
+                _limiting_reset_ts(value, self._models)
+                if isinstance(value, dict)
+                else None
+            )
+
+        known = [(ts, n) for n in candidates if (ts := back_at(n)) is not None]
+        if not known:
+            return None
+        ts, num = min(known)
+        mine = back_at(current)
+        if mine is not None and ts > mine - SOONEST_RESET_MARGIN_S:
+            return None  # the active account is back first (or as good as)
+        return num
 
     def _note_cooldown_wake(self, state: dict) -> None:
         """A switch was wanted but cooldown-blocked: wake when it lifts."""

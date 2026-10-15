@@ -81,6 +81,9 @@ class AutoSwitchSettings:
     # Use the live reading Claude Code's status line writes to
     # <backup_root>/live-usage.json (see live_feed) for the active account.
     live_feed: bool = True
+    # When every account is exhausted, switch to the one that resets first
+    # (only once the active account is exhausted too).
+    exhausted_switch_to_soonest: bool = True
 
 
 @dataclass(frozen=True)
@@ -181,6 +184,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "liveFeed", "live_feed", "bool",
             help="Use Claude Code's status-line usage (live-usage.json) when it's fresh",
+        ),
+        SettingSpec(
+            "autoswitch", "exhaustedSwitchToSoonest", "exhausted_switch_to_soonest", "bool",
+            help="When every account is used up, switch to the one that resets first",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

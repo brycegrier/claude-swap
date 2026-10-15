@@ -577,9 +577,11 @@ class TestDecisionTable:
         assert (temp_home / ".claude" / ".credentials.json").read_text() == live_before
 
     def test_all_exhausted_carries_earliest_reset(self, harness):
+        # The active account resets first, so there's nothing better to sit
+        # on (else TestSoonestResetWhenAllExhausted's switch applies).
         outcome = harness.tick_with_usage({
-            "1": _usage(100, "2026-07-03T12:00:00Z"),
-            "2": _usage(100, "2026-07-03T10:30:00Z"),
+            "1": _usage(100, "2026-07-03T10:30:00Z"),
+            "2": _usage(100, "2026-07-03T12:00:00Z"),
             "3": _usage(100, "2026-07-03T11:00:00Z"),
         })
         assert outcome is TickOutcome.BLOCKED
@@ -3585,11 +3587,12 @@ class TestEveryAccountAboveThreshold:
         assert harness.active_number() == 1
 
     def test_all_at_limit_still_reports_exhausted(self, harness):
-        """h <= 0 is still never a target: with everything truly maxed there
-        is nowhere to go and the exhausted path must still own that case."""
+        """h <= 0 is never a ranked target: with everything truly maxed and
+        the active account back first, the exhausted path owns the case. (A
+        sooner-resetting exhausted peer is the soonest-reset switch instead.)"""
         outcome = harness.tick_with_usage({
-            "1": _usage(100, self._at(harness, 600)),
-            "2": _usage(100, self._at(harness, 300)),
+            "1": _usage(100, self._at(harness, 300)),
+            "2": _usage(100, self._at(harness, 600)),
             "3": _usage(100, self._at(harness, 900)),
         })
         assert outcome is TickOutcome.BLOCKED
@@ -7400,3 +7403,99 @@ class TestTickerRows:
         event = NoSwitchEvent(reason="cooldown")
         assert event.to_json()["reason"] == "cooldown"
         assert event.to_json()["detail"] == ""
+
+
+class TestSoonestResetWhenAllExhausted:
+    """Everything used up: sit on the account that comes back first."""
+
+    @staticmethod
+    def _iso(h, seconds: float) -> str:
+        from datetime import datetime as _dt, timezone as _tz
+
+        return (
+            _dt.fromtimestamp(h.clock.now + seconds, tz=_tz.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+
+    def test_switches_to_the_soonest_reset(self, harness):
+        outcome = harness.tick_with_usage({
+            "1": _usage(100, self._iso(harness, 4 * 3600)),
+            "2": _usage(100, self._iso(harness, 3600)),
+            "3": _usage(100, self._iso(harness, 2 * 3600)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "soonest-reset"
+        assert "resets first" in sw.human()
+
+    def test_stays_when_the_active_account_is_back_first(self, harness):
+        outcome = harness.tick_with_usage({
+            "1": _usage(100, self._iso(harness, 600)),
+            "2": _usage(100, self._iso(harness, 3600)),
+            "3": _usage(100, self._iso(harness, 7200)),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert harness.active_number() == 1
+        assert any(isinstance(e, AllExhaustedEvent) for e in harness.events)
+
+    def test_a_few_seconds_head_start_is_not_worth_a_switch(self, harness):
+        outcome = harness.tick_with_usage({
+            "1": _usage(100, self._iso(harness, 3600)),
+            "2": _usage(100, self._iso(harness, 3600 - 30)),
+            "3": _usage(100, self._iso(harness, 7200)),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert harness.active_number() == 1
+
+    def test_never_while_the_active_account_has_room(self, harness):
+        # 99.5% used, everyone else exhausted: keep the last half point.
+        outcome = harness.tick_with_usage({
+            "1": _usage(99.5, self._iso(harness, 4 * 3600)),
+            "2": _usage(100, self._iso(harness, 600)),
+            "3": _usage(100, self._iso(harness, 600)),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert harness.active_number() == 1
+
+    def test_unknown_resets_never_win(self, harness):
+        outcome = harness.tick_with_usage({
+            "1": _usage(100, self._iso(harness, 3600)),
+            "2": _usage(100),  # no reset known
+            "3": _usage(100),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert harness.active_number() == 1
+
+    def test_the_setting_turns_it_off(self, temp_home):
+        h = EngineHarness(temp_home, exhausted_switch_to_soonest=False)
+        for n, e in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            h.seed(n, e)
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage(100, self._iso(h, 4 * 3600)),
+            "2": _usage(100, self._iso(h, 3600)),
+            "3": _usage(100, self._iso(h, 7200)),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    def test_limit_hit_summary_says_when_it_comes_back(self):
+        from claude_swap.cli import _limit_hit_summary
+
+        iso = "2026-10-15T05:19:00Z"
+        poll = PollEvent(
+            active={"number": 1, "email": "b@x.edu"},
+            headroom={"1": 0.0, "2": 0.0}, threshold=99.0,
+            reset_at={"2": iso},
+        )
+        sw = SwitchEvent(
+            trigger="soonest-reset",
+            from_ref={"number": 1, "email": "b@x.edu"},
+            to_ref={"number": 2, "email": "s@x.edu"},
+        )
+        assert _limit_hit_summary([poll, sw]) == (
+            "cswap: every account is used up — switched to #2 (s@x.edu), "
+            f"which resets first at {autoswitch._local_clock(iso)}."
+        )
