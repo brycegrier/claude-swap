@@ -55,7 +55,7 @@ def bar_cells(
     fill_style = f"{color} dim" if stale else color
     for i in range(width):
         if tick_at is not None and i == tick_at:
-            text.append(_BAR_TICK, style=palette.sev_warn)
+            text.append(_BAR_TICK, style=palette.tick)
         elif i < full:
             text.append(_BAR_FILLED, style=fill_style)
         elif i == full and half:

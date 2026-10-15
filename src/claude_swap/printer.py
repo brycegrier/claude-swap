@@ -22,14 +22,14 @@ _PALETTES: dict[str, dict[str, str]] = {
     "dark": {
         "accent": "\033[38;2;157;177;255m",  # #9db1ff periwinkle
         "muted": "\033[38;2;139;149;165m",  # #8b95a5 slate
-        "red": "\033[38;2;238;116;56m",  # #ee7438 vermilion
+        "red": "\033[38;2;232;105;46m",  # #e8692e vermilion
         "yellow": "\033[38;2;240;196;60m",  # #f0c43c gold
     },
     "light": {
         "accent": "\033[38;2;61;85;196m",  # #3d55c4 deep periwinkle
         "muted": "\033[38;2;86;96;114m",  # #566072 slate
-        "red": "\033[38;2;166;61;12m",  # #a63d0c deep vermilion
-        "yellow": "\033[38;2;127;88;0m",  # #7f5800 deep gold
+        "red": "\033[38;2;166;61;12m",  # #a63d0c deep vermilion (AA on panel)
+        "yellow": "\033[38;2;127;88;0m",  # #7f5800 deep gold (AA on panel)
     },
 }
 

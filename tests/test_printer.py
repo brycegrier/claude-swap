@@ -145,7 +145,7 @@ class TestLinePrinters:
         monkeypatch.setenv("FORCE_COLOR", "1")
         printer.error("something failed")
         captured = capsys.readouterr()
-        assert "\033[38;2;238;116;56m" in captured.err  # vermilion
+        assert "\033[38;2;232;105;46m" in captured.err  # vermilion
 
     def test_warning_prints_to_stdout(self, monkeypatch, capsys):
         monkeypatch.setenv("NO_COLOR", "1")

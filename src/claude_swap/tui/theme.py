@@ -3,9 +3,10 @@
 "Signal": cool slate neutrals, a periwinkle accent kept apart from the
 usage colors, and a blue → gold → vermilion severity ramp drawn from the
 Okabe–Ito colorblind-safe set. No red/green pairing: each step also changes
-lightness, so the bars read with any color vision. Every text color meets
-WCAG AA (≥ 4.5:1) on both the background and the panel (the worst-case row
-background) in each theme.
+lightness, so the bars read with any color vision. The threshold tick is
+the Okabe–Ito reddish purple, a hue none of the bar fills or the accent
+use, so it stays visible over any bar. Tuned for dark terminals; the light
+theme carries the same hues for now and is due its own palette.
 """
 
 from __future__ import annotations
@@ -27,8 +28,9 @@ PANEL = "#232a35"
 # Usage severity ramp — blue, gold, vermilion (Okabe–Ito family).
 SEV_OK = "#56b4e9"  # sky blue: plenty of headroom
 SEV_WARN = "#f0c43c"  # gold: climbing (>= 70%)
-SEV_CRIT = "#ee7438"  # vermilion: near the limit (>= 90%)
+SEV_CRIT = "#e8692e"  # vermilion: near the limit (>= 90%)
 TRACK = "#2f3744"  # unfilled bar track
+TICK = "#cc79a7"  # threshold tick: reddish purple, distinct from every fill
 
 # Severity band edges. WARN mirrors where a user starts caring; CRIT mirrors
 # the auto-switch default threshold so bar color and switch behavior agree.
@@ -53,6 +55,7 @@ class Palette:
     sev_warn: str
     sev_crit: str
     track: str
+    tick: str = TICK  # the threshold mark on usage bars
 
     DARK: ClassVar["Palette"]
 
@@ -75,6 +78,7 @@ class Palette:
             sev_warn=theme.warning,
             sev_crit=theme.error,
             track=theme.variables.get("track", TRACK),
+            tick=theme.variables.get("tick", TICK),
         )
 
 
@@ -98,22 +102,24 @@ CSWAP_DARK = Theme(
         "block-cursor-foreground": FOREGROUND,
         "block-cursor-text-style": "none",
         "track": TRACK,
+        "tick": TICK,
     },
 )
 
-# Light companion palette (same intent on a cool near-white base). The
-# severity colors are deepened so text meets AA on the panel (worst-case
-# row background).
+# Light companion palette (same hues on a cool near-white base), deepened to
+# keep the light theme's AA guarantee (tests/test_theme.py). A placeholder
+# until the light theme gets a palette of its own.
 ACCENT_LIGHT = "#3d55c4"  # deep periwinkle
 FOREGROUND_LIGHT = "#1e2430"
 MUTED_LIGHT = "#566072"
 BACKGROUND_LIGHT = "#f6f8fb"
 SURFACE_LIGHT = "#eaeef4"
 PANEL_LIGHT = "#dfe5ee"  # most-elevated = darkest (inverted from dark)
-SEV_OK_LIGHT = "#1a6496"  # deep blue
-SEV_WARN_LIGHT = "#7f5800"  # deep gold
-SEV_CRIT_LIGHT = "#a63d0c"  # deep vermilion
+SEV_OK_LIGHT = "#1a6496"  # deep blue — deepened for AA on panel
+SEV_WARN_LIGHT = "#7f5800"  # deep gold — deepened for AA on panel
+SEV_CRIT_LIGHT = "#a63d0c"  # deep vermilion — deepened for AA on panel
 TRACK_LIGHT = "#c9d1dd"
+TICK_LIGHT = "#a3407a"  # reddish purple
 
 CSWAP_LIGHT = Theme(
     name="cswap-light",
@@ -134,10 +140,11 @@ CSWAP_LIGHT = Theme(
         "block-cursor-foreground": FOREGROUND_LIGHT,
         "block-cursor-text-style": "none",
         "track": TRACK_LIGHT,
+        "tick": TICK_LIGHT,
     },
 )
 
 Palette.DARK = Palette(
     accent=ACCENT, foreground=FOREGROUND, muted=MUTED,
-    sev_ok=SEV_OK, sev_warn=SEV_WARN, sev_crit=SEV_CRIT, track=TRACK,
+    sev_ok=SEV_OK, sev_warn=SEV_WARN, sev_crit=SEV_CRIT, track=TRACK, tick=TICK,
 )
