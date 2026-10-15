@@ -2072,8 +2072,8 @@ class TestEventsShape:
         rows = dict(poll.rows())
         assert rows["active"].startswith("#1 a  42% used (switch at 90%)")
         # Others show per-window pcts, not just the ambiguous binding pct.
-        assert "#2 5h 10%  7d 0%" in rows["others"]
-        assert "#3 ?" in rows["others"]
+        assert "#2 b 5h 10%  7d 0%" in rows["others"]
+        assert "#3 c ?" in rows["others"]
 
     def test_poll_event_windows_match_the_decision_set(self, temp_home):
         # Scoped windows appear only when configured: rendering an ignored
@@ -2097,14 +2097,14 @@ class TestEventsShape:
         plain = build()
         plain.tick_with_usage(usage)
         poll = next(e for e in plain.events if isinstance(e, PollEvent))
-        assert "#2 5h 3%  7d 89%" in poll.human()
+        assert "#2 b 5h 3%  7d 89%" in poll.human()
         assert "Fable" not in poll.human()
         assert poll.to_json()["windowsPct"]["2"] == {"5h": 3.0, "7d": 89.0}
 
         modeled = build(model="Fable")
         modeled.tick_with_usage(usage)
         poll = next(e for e in modeled.events if isinstance(e, PollEvent))
-        assert "#2 5h 3%  7d 89%  Fable 21%" in poll.human()
+        assert "#2 b 5h 3%  7d 89%  Fable 21%" in poll.human()
         assert poll.to_json()["windowsPct"]["2"] == {
             "5h": 3.0, "7d": 89.0, "Fable": 21.0,
         }
@@ -7179,7 +7179,7 @@ class TestLiveFeed:
         outcome = harness.tick_with_entries(self._stored(harness, self._usage3(50)))
         assert outcome is TickOutcome.SWITCHED
         poll = next(e for e in harness.events if isinstance(e, PollEvent))
-        assert poll.live and "95% used (switch at 90%) · live" in poll.human()
+        assert poll.live and "95% used (switch at 90%) · status line" in poll.human()
         sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "proactive"
 
@@ -7192,7 +7192,7 @@ class TestLiveFeed:
         assert outcome is TickOutcome.SWITCHED
         assert not harness.engine._feed_live
         poll = next(e for e in harness.events if isinstance(e, PollEvent))
-        assert poll.live and "· live 3m ago" in poll.human()
+        assert poll.live and "· status line 3m ago" in poll.human()
 
     def test_a_reading_past_the_hold_is_ignored(self, harness):
         from claude_swap.live_feed import FEED_HOLD_S
@@ -7351,7 +7351,7 @@ class TestTickerRows:
         )
         lines = autoswitch.block_lines(poll, "09:36:48")
         assert lines == [
-            ("09:36:48", "active", "#2 sabaf  92% used (switch at 99%)"),
+            ("09:36:48", "active", "#2 sabaf  92% used (switch at 99%) · API now"),
             ("", "others", "#1 4%"),
             ("", "api", "polled #2 · 21 requests this hour"),
         ]
@@ -7402,9 +7402,31 @@ class TestTickerRows:
             from_ref={"number": 1, "email": "bdgrier@x.edu"},
             to_ref={"number": 2, "email": "sabaf@x.edu"},
         )
-        assert sw.rows() == [("decision", "➜ switched #1 → #2 sabaf (hit the limit)")]
+        assert sw.rows() == [
+            ("decision", "➜ switched #1 bdgrier → #2 sabaf (hit the limit)")
+        ]
         dry = replace(sw, dry_run=True, trigger="proactive")
-        assert dry.human() == "➜ would switch #1 → #2 sabaf (reached the switch point)"
+        assert dry.human() == (
+            "➜ would switch #1 bdgrier → #2 sabaf (reached the switch point)"
+        )
+
+    def test_accounts_are_named_alike_and_aliases_win(self):
+        poll = PollEvent(
+            active={"number": 2, "email": "sabaf@x.edu"},
+            headroom={"2": 60.0, "1": 0.0}, threshold=99.0,
+            names={"1": "work", "2": "s"}, api_age_s=240.0,
+        )
+        rows = dict(poll.rows())
+        assert rows["active"] == "#2 s  40% used (switch at 99%) · API 4m ago"
+        assert rows["others"] == "#1 work 100%"
+        sw = SwitchEvent(
+            trigger="proactive",
+            from_ref={"number": 2, "email": "sabaf@x.edu"},
+            to_ref={"number": 1, "email": "bdgrier@x.edu"},
+            names={"1": "work", "2": "s"},
+        )
+        assert "#2 s → #1 work" in sw.human()
+        assert "names" not in sw.to_json() and "names" not in poll.to_json()
 
     def test_all_exhausted_uses_local_time(self):
         iso = "2026-10-15T05:20:00.433656Z"

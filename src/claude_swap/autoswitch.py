@@ -305,11 +305,14 @@ def _short_name(email: str | None) -> str:
     return (email or "").split("@", 1)[0]
 
 
-def _ref_text(ref: dict | None) -> str:
+def _ref_text(ref: dict | None, names: dict[str, str] | None = None) -> str:
+    """``#2 sabaf`` — the number, then the account's alias if it has one,
+    else the start of its email. Every ticker row names accounts this way."""
     if not ref:
         return "?"
-    name = _short_name(ref.get("email"))
-    return f"#{ref.get('number')} {name}".rstrip()
+    num = str(ref.get("number"))
+    name = (names or {}).get(num) or _short_name(ref.get("email"))
+    return f"#{num} {name}".rstrip()
 
 
 def _local_clock(value: float | str | None) -> str:
@@ -423,6 +426,10 @@ class PollEvent(AutoSwitchEvent):
     # account number → ISO time an exhausted account's blocking window(s)
     # reset, so "100%" reads with when it comes back. Additive.
     reset_at: dict[str, str] = field(default_factory=dict)
+    # Display only (not in to_json): account labels (alias, else the start
+    # of the email) and how old the active account's API reading is.
+    names: dict[str, str] = field(default_factory=dict)
+    api_age_s: float | None = None
 
     def _fields(self) -> dict:
         fields = {
@@ -463,14 +470,23 @@ class PollEvent(AutoSwitchEvent):
         err = self.fetch_errors.get(num)
         return f"? ({err})" if err else "?"
 
-    def _live_text(self) -> str:
-        """`` · live``, or `` · live 4m ago`` once the reading is held."""
-        if not self.live:
-            return ""
-        age = self.live_age_s
-        if age is None or age <= FEED_FRESH_S:
-            return " · live"
-        return f" · live {_span(age)} ago"
+    def _label(self, num: str) -> str:
+        return _ref_text({"number": num, "email": ""}, self.names).rstrip()
+
+    def _source_text(self, num: str) -> str:
+        """Where the active reading came from: Claude Code's status line
+        (free, live) or the usage API — and how old it is when that matters."""
+        if self.live:
+            age = self.live_age_s
+            if age is None or age <= FEED_FRESH_S:
+                return " · status line"
+            return f" · status line {_span(age)} ago"
+        if num in self.fetched:
+            return " · API now"
+        age = self.api_age_s
+        if age is not None and age >= 60:
+            return f" · API {_span(age)} ago"
+        return " · API"
 
     def _api_rows(self) -> list[tuple[str, str]]:
         """``polled #2 · 21 requests this hour``, 429s, captured headers."""
@@ -486,21 +502,22 @@ class PollEvent(AutoSwitchEvent):
                 backing = f", backing off until {_local_clock(until)}" if until else ""
                 per_hour = f" · {_requests(count)} this hour" if count is not None else ""
                 rows.append(
-                    ("api", f"⚠ #{num} rate-limited ({cause}){backing}{per_hour}")
+                    ("api", f"⚠ {self._label(num)} rate-limited ({cause}){backing}{per_hour}")
                 )
             else:
                 plain.append((num, count))
             headers = self.rate_headers.get(num)
             if headers:
                 shown = ", ".join(f"{k}={v}" for k, v in sorted(headers.items()))
-                rows.append(("api", f"#{num} headers: {shown}"))
+                rows.append(("api", f"{self._label(num)} headers: {shown}"))
         if len(plain) == 1:
             num, count = plain[0]
             per_hour = f" · {_requests(count)} this hour" if count is not None else ""
-            rows.insert(0, ("api", f"polled #{num}{per_hour}"))
+            rows.insert(0, ("api", f"polled {self._label(num)}{per_hour}"))
         elif plain:
             listed = ", ".join(
-                f"#{n} ({c}/h)" if c is not None else f"#{n}" for n, c in plain
+                f"{self._label(n)} ({c}/h)" if c is not None else self._label(n)
+                for n, c in plain
             )
             rows.insert(0, ("api", f"polled {listed}"))
         return rows
@@ -512,13 +529,13 @@ class PollEvent(AutoSwitchEvent):
         switch_at = f"(switch at {pct_label(self.threshold)}%)"
         h = self.headroom.get(num)
         if h is not None:
-            used = f"{100 - h:.0f}% used {switch_at}" + self._live_text()
+            used = f"{100 - h:.0f}% used {switch_at}" + self._source_text(num)
         else:
             err = self.fetch_errors.get(num)
             used = f"usage unknown{f' ({err})' if err else ''} {switch_at}"
-        rows = [("active", f"{_ref_text(self.active)}  {used}")]
+        rows = [("active", f"{_ref_text(self.active, self.names)}  {used}")]
         others = [
-            f"#{n} {self._describe(n)}"
+            f"{self._label(n)} {self._describe(n)}"
             + (f" (resets {_local_clock(self.reset_at[n])})" if n in self.reset_at else "")
             for n in self.headroom
             if n != num
@@ -547,6 +564,8 @@ class SwitchEvent(AutoSwitchEvent):
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
     dry_run: bool = False
+    # Display only (not in to_json): account labels, as on PollEvent.
+    names: dict[str, str] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         return {
@@ -559,9 +578,10 @@ class SwitchEvent(AutoSwitchEvent):
 
     def rows(self) -> list[tuple[str, str]]:
         verb = "would switch" if self.dry_run else "switched"
-        src = f"#{self.from_ref.get('number')}" if self.from_ref else "(none)"
+        src = _ref_text(self.from_ref, self.names) if self.from_ref else "(none)"
+        dst = _ref_text(self.to_ref, self.names)
         why = _TRIGGER_TEXT.get(self.trigger, self.trigger)
-        return [("decision", f"➜ {verb} {src} → {_ref_text(self.to_ref)} ({why})")]
+        return [("decision", f"➜ {verb} {src} → {dst} ({why})")]
 
 
 # no-switch reason code → ticker phrase. ``{detail}`` takes the event's
@@ -971,6 +991,7 @@ class AutoSwitchEngine:
         # stretched active plan), and when the active account last changed
         # (feed attribution).
         self._live_reading: LiveReading | None = None
+        self._names: dict[str, str] = {}
         self._live_age_s: float | None = None
         self._live_used = False
         self._feed_live = False
@@ -1294,6 +1315,7 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         self._refresh_live_reading(current, state)
+        self._names = self._account_names(current)
         current_email = self.switcher.account_email(current)
         active_ref = _ref(current, current_email) if current_email else {
             "number": int(current),
@@ -1312,6 +1334,8 @@ class AutoSwitchEngine:
                 threshold=settings.threshold,
                 live=self._live_used,
                 live_age_s=self._live_age_s if self._live_used else None,
+                names=self._names,
+                api_age_s=getattr(entries.get(current), "age_s", None),
                 **fetch_report,
                 fetch_errors={
                     num: entry.last_error
@@ -2543,6 +2567,7 @@ class AutoSwitchEngine:
                     from_ref=_ref(current, current_email) if current else None,
                     to_ref=_ref(number, email),
                     dry_run=True,
+                    names=self._names,
                 )
             )
             return TickOutcome.SWITCHED
@@ -2599,6 +2624,7 @@ class AutoSwitchEngine:
                 from_ref=result.get("from"),
                 to_ref=result.get("to"),
                 warnings=result.get("warnings", []),
+                names=self._names,
             )
         )
         return TickOutcome.SWITCHED
@@ -2632,6 +2658,19 @@ class AutoSwitchEngine:
         if mine is not None and ts > mine - SOONEST_RESET_MARGIN_S:
             return None  # the active account is back first (or as good as)
         return num
+
+    def _account_names(self, current: str) -> dict[str, str]:
+        """Ticker labels: each account's alias, else the start of its email.
+        Display only — never decides anything — so any failure is just {}."""
+        try:
+            aliases = {num: alias for num, alias, _ in self.switcher.list_aliases()}
+            nums = {current, *self.switcher.switchable_account_numbers()}
+            return {
+                num: aliases.get(num) or _short_name(self.switcher.account_email(num))
+                for num in nums
+            }
+        except Exception:
+            return {}
 
     def _note_cooldown_wake(self, state: dict) -> None:
         """A switch was wanted but cooldown-blocked: wake when it lifts."""
