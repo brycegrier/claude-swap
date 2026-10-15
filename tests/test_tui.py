@@ -1382,65 +1382,9 @@ class TestAutoScreen:
             await pilot.pause()
             assert screen._settings.threshold == 50.0  # spec's lower bound
 
-    async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
-        fake = FakeSwitcher(
-            [
-                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
-                make_account(2, entry=make_entry(80.0, 10.0)),
-                make_account(3, entry=make_entry(15.0, 5.0)),
-            ],
-            tmp_path,
-        )
-        app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
-            await settle(pilot)
-            from textual.widgets import Static
-
-            plain = app.screen.query_one("#candidates", Static).render().plain
-            assert plain.index("user3@example.com") < plain.index(
-                "user2@example.com"
-            )
-
-    async def test_candidates_ranking_honors_configured_model(
-        self, tmp_path, fake_engine
-    ):
-        """The 'Next best' ranking must use the same window set as the
-        engine: with autoswitch.model set, a Fable-bound account ranks by
-        its Fable pct, not its roomy 5h."""
-        import json as _json
-
-        (tmp_path / "settings.json").write_text(_json.dumps({
-            "schemaVersion": 1, "autoswitch": {"model": "Fable"},
-        }))
-        fake = FakeSwitcher(
-            [
-                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
-                make_account(
-                    2, entry=make_entry(10.0, 5.0, scoped=[("Fable", 95.0)])
-                ),
-                make_account(
-                    3, entry=make_entry(50.0, 5.0, scoped=[("Fable", 20.0)])
-                ),
-            ],
-            tmp_path,
-        )
-        app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
-            await settle(pilot)
-            from textual.widgets import Static
-
-            plain = app.screen.query_one("#candidates", Static).render().plain
-            # On 5h alone #2 (10% used) would rank first; Fable 95% binds it
-            # below #3 (50% binding).
-            assert plain.index("user3@example.com") < plain.index(
-                "user2@example.com"
-            )
-
-    async def test_candidates_show_full_cards(self, tmp_path, fake_engine):
-        """Each candidate renders like the switch screen: per-window bars,
-        pcts and reset countdowns — and a sentinel label in place of bars."""
+    async def test_cards_on_top_then_engine_line_then_log(self, tmp_path, fake_engine):
+        """Laid out like the dashboard: every account's full card first, the
+        mode badge / summary line below the cards, the decision log last."""
         fake = FakeSwitcher(
             [
                 make_account(1, active=True, entry=make_entry(91.0, 20.0)),
@@ -1450,22 +1394,22 @@ class TestAutoScreen:
             tmp_path,
         )
         app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
+        async with app.run_test(size=(100, 50)) as pilot:
             await self._open(pilot)
             await settle(pilot)
-            from textual.widgets import Static
+            screen = app.screen
+            from claude_swap.tui.widgets import AccountsPanel
 
-            plain = app.screen.query_one("#candidates", Static).render().plain
-            card2 = plain[plain.index("user2@example.com"):plain.index(
-                "user3@example.com"
-            )]
-            assert "5h" in card2 and "7d" in card2
-            assert "━" in card2 and "80%" in card2
-            assert "resets" in card2
+            plain = screen.query_one("#auto-active-panel", AccountsPanel).render().plain
+            card2 = plain[plain.index("user2@example.com"):plain.index("user3@example.com")]
+            assert "━" in card2 and "80%" in card2 and "resets" in card2
             card3 = plain[plain.index("user3@example.com"):]
             assert tui_data.sentinel_label(USAGE_TOKEN_EXPIRED) in card3
-            assert "━" not in card3
-
+            cards = screen.query_one("#auto-cards-scroll").region
+            line = screen.query_one("#auto-top").region
+            log = screen.query_one("#event-log").region
+            assert cards.y < line.y < log.y
+            assert log.height > 0  # the cap keeps the log on screen
 
 class TestEventText:
     def test_switch_event_styling_and_content(self):
