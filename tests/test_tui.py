@@ -1697,3 +1697,58 @@ class TestSettingsMenu:
             await pilot.click("#reset")
             await pilot.pause()
             assert "cooldownSeconds" not in self._autoswitch(tmp_path)
+
+
+class TestLiveFeedOnCards:
+    """The active account's card shows Claude Code's status-line reading
+    when it is newer than the stored API one — what the engine decides on."""
+
+    @staticmethod
+    def _feed(tmp_path, pct: float, written_at: float) -> None:
+        from claude_swap.live_feed import live_usage_path
+
+        live_usage_path(tmp_path).write_text(json.dumps({
+            "writtenAt": written_at,
+            "rate_limits": {"five_hour": {"used_percentage": pct}},
+        }))
+
+    def _source(self, tmp_path, api_age: float = 600.0):
+        fake = FakeSwitcher(
+            [make_account(1, active=True, entry=make_entry(53.0, 10.0, age_s=api_age)),
+             make_account(2, entry=make_entry(100.0, 10.0))],
+            tmp_path,
+        )
+        return fake, tui_data.SnapshotSource(fake)
+
+    @staticmethod
+    def _active(snap):
+        return next(a for a in snap.accounts if a.is_active)
+
+    def test_newer_feed_reading_shows_on_the_active_card(self, tmp_path):
+        _fake, source = self._source(tmp_path)
+        self._feed(tmp_path, 89.0, time.time() - 5)
+        acc = self._active(source.take(store_only=True))
+        assert acc.live_feed
+        assert acc.usage.last_good["five_hour"]["pct"] == 89.0
+        assert acc.usage.last_good["seven_day"]["pct"] == 10.0  # kept from the API row
+        from claude_swap.tui.widgets import account_card_text
+
+        assert "status line" in account_card_text(acc, 100).plain
+        # sticks across takes while the store still holds the older API row
+        assert self._active(source.take(store_only=True)).live_feed
+
+    def test_an_older_feed_reading_never_replaces_the_api_one(self, tmp_path):
+        _fake, source = self._source(tmp_path, api_age=5.0)
+        self._feed(tmp_path, 89.0, time.time() - 60)
+        acc = self._active(source.take(store_only=True))
+        assert not acc.live_feed
+        assert acc.usage.last_good["five_hour"]["pct"] == 53.0
+
+    def test_a_reading_from_before_the_last_switch_is_not_shown(self, tmp_path):
+        _fake, source = self._source(tmp_path)
+        now = time.time()
+        (tmp_path / "autoswitch_state.json").write_text(
+            json.dumps({"schemaVersion": 1, "lastSwitchAt": now - 2})
+        )
+        self._feed(tmp_path, 89.0, now - 3)
+        assert not self._active(source.take(store_only=True)).live_feed

@@ -114,10 +114,7 @@ SLEEP_EVENT_MIN_S = 60.0
 # While Claude Code's status-line feed is live the loop re-reads it this
 # often — a local file read, no API request.
 FEED_CHECK_S = 10.0
-# A feed reading counts for the active account only if written at least this
-# long after that account became active: right after a switch, Claude Code's
-# status line still shows the previous account until its next response.
-FEED_ATTRIBUTION_GRACE_S = 5.0
+from claude_swap.live_feed import FEED_ATTRIBUTION_GRACE_S  # noqa: E402  (re-export)
 
 # Idle-hold cap (elapsed, not ticks — the hold itself slows the cadence to
 # NO_RESET_FALLBACK_S): an owned-and-expired token normally means Claude Code

@@ -232,6 +232,12 @@ class AutoScreen(Screen):
         active = next(
             (a for a in (snap.accounts if snap else ()) if a.is_active), None
         )
+        if active is not None:
+            backoff = active.usage.backoff_until
+            if backoff is not None and backoff > time.time():
+                when = time.strftime("%H:%M", time.localtime(backoff))
+                source = " · using the status line" if active.live_feed else ""
+                return f"usage API rate-limited, retry {when}{source}"
         interval = active.usage.poll_interval_s if active is not None else None
         if interval is None:
             return "usage polls adapt to room left"

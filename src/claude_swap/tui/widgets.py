@@ -183,9 +183,14 @@ def account_card_text(
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
-    age = data.format_age(acc.usage.age_s)
-    if age:
-        text.append(f"   {age}", style=palette.muted)
+    if acc.live_feed:
+        # From Claude Code's status line; its age shows once it's held.
+        age = data.format_age(acc.usage.age_s)
+        text.append(f"   · status line{(' ' + age[2:]) if age else ''}", style=palette.muted)
+    else:
+        age = data.format_age(acc.usage.age_s)
+        if age:
+            text.append(f"   {age}", style=palette.muted)
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:

@@ -140,6 +140,9 @@ class AccountSnapshot:
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    # ``usage`` came from Claude Code's status-line feed (live, free), laid
+    # over the stored API reading because it is newer.
+    live_feed: bool = False
 
     @property
     def display_tag(self) -> str:

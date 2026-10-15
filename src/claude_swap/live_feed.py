@@ -52,6 +52,25 @@ class LiveReading:
     usage: dict  # {"five_hour": {"pct", "resets_at"}, "seven_day": {...}}
 
 
+# A reading counts for the active account only if written at least this long
+# after that account became active: right after a switch, Claude Code's
+# status line still shows the previous account until its next response.
+FEED_ATTRIBUTION_GRACE_S = 5.0
+
+
+def attributable(reading: LiveReading, active_since: float | None) -> bool:
+    """Whether ``reading`` belongs to the account active since ``active_since``."""
+    return active_since is None or reading.written_at >= active_since + FEED_ATTRIBUTION_GRACE_S
+
+
+def merged_usage(stored: dict | None, reading: LiveReading) -> dict:
+    """The stored usage with the feed's 5h/7d windows laid over it (the feed
+    carries no per-model scoped windows, so those stay from the API row)."""
+    base = dict(stored) if isinstance(stored, dict) else {}
+    base.update(reading.usage)
+    return base
+
+
 def live_usage_path(backup_root: Path) -> Path:
     return backup_root / LIVE_USAGE_FILENAME
 
