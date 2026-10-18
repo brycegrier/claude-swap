@@ -116,8 +116,43 @@ _FSYNC_UNSUPPORTED = frozenset(
 )
 
 
+# ``os.path.ALLOW_MISSING`` (3.12.11 / 3.13.4 and later) resolves a symlink
+# chain strictly -- a loop or any other resolution error raises -- while
+# allowing the final referent to be missing. Older patch releases fall back to
+# fully strict resolution, which refuses a dangling link rather than guess.
+# Module-level so a test can pin the fallback without touching ``os.path``.
+_RESOLVE_STRICT = getattr(os.path, "ALLOW_MISSING", True)
+
+
+def publish_target(path: os.PathLike | str) -> Path:
+    """Where a publish to ``path`` lands: ``path`` itself or, for a symlink,
+    the end of its chain.
+
+    Written THROUGH a link rather than over it: a rename swaps a directory
+    entry and never follows links, so renaming onto a symlinked path detaches
+    it -- the write succeeds, the content is right, and the link's target
+    silently stops receiving updates (#192). Claude Code's own config writer
+    writes through a symlinked ``~/.claude.json`` for the same reason.
+
+    Resolution is ``os.path.realpath`` with ``strict=os.path.ALLOW_MISSING``:
+    the whole chain (not one hop), a missing final referent allowed (a
+    dangling link writes where it points), a loop or any other resolution
+    error raised. Not the non-strict default: that collapses
+    ``loop/../victim.json`` lexically into ``victim.json`` and would aim the
+    write at a different file than ``open`` reaches (which fails with ELOOP).
+    """
+    target = Path(path)
+    if not target.is_symlink():
+        return target
+    return Path(os.path.realpath(target, strict=_RESOLVE_STRICT))
+
+
 def atomic_write_bytes(
-    path: os.PathLike | str, data: bytes, *, mode: int = 0o600
+    path: os.PathLike | str,
+    data: bytes,
+    *,
+    mode: int = 0o600,
+    follow_symlinks: bool = True,
 ) -> None:
     """Publish ``data`` at ``path`` by temp file + rename.
 
@@ -129,6 +164,12 @@ def atomic_write_bytes(
     then write) cannot promise, and why the switch rollback must not use it:
     Claude Code watches ``~/.claude.json`` and treats a torn read as a
     corrupted config (#419).
+
+    ``follow_symlinks`` (the default) publishes onto the end of a symlink
+    chain so the link survives -- see :func:`publish_target`. Pass ``False``
+    for a destination the user typed, such as an export file under ``/tmp``,
+    where a link planted by someone else must not redirect the write: the
+    rename then replaces the link itself.
 
     Precisely what is promised: a failure before the rename leaves the
     destination exactly as it was and removes the temp; no further ordinary
@@ -149,7 +190,7 @@ def atomic_write_bytes(
     there (keeping its temp until the rewrite lands); that is the shape to copy
     if anyone ever asks for it, in this one place.
     """
-    target = Path(path)
+    target = publish_target(path) if follow_symlinks else Path(path)
     fd, tmp = tempfile.mkstemp(
         dir=str(target.parent), prefix=f"{target.name}.", suffix=".tmp"
     )
@@ -184,7 +225,13 @@ def atomic_write_bytes(
 
 
 def atomic_write_text(
-    path: os.PathLike | str, text: str, *, mode: int = 0o600
+    path: os.PathLike | str,
+    text: str,
+    *,
+    mode: int = 0o600,
+    follow_symlinks: bool = True,
 ) -> None:
     """:func:`atomic_write_bytes` for UTF-8 text."""
-    atomic_write_bytes(path, text.encode("utf-8"), mode=mode)
+    atomic_write_bytes(
+        path, text.encode("utf-8"), mode=mode, follow_symlinks=follow_symlinks
+    )

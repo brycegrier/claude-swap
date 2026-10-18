@@ -12,6 +12,7 @@ import pytest
 from claude_swap.fsutil import (
     atomic_write_bytes,
     atomic_write_text,
+    publish_target,
     read_text_with_retry,
     replace_with_retry,
 )
@@ -401,3 +402,129 @@ class TestAtomicWrite:
         atomic_write_bytes(target, payload)
         assert target.read_bytes() == payload
         assert list(tmp_path.iterdir()) == [target]
+
+
+class TestAtomicWriteSymlinks:
+    """A rename never follows a link: renaming onto a symlinked path detaches
+    it silently (#192). The writer publishes onto the end of the chain, as
+    Claude Code's own config writer does for ``~/.claude.json``."""
+
+    def test_writes_through_a_link_and_keeps_it(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        live = tmp_path / "live"
+        live.mkdir()
+        tracked = repo / ".claude.json"
+        tracked.write_text("old")
+        link = live / ".claude.json"
+        link.symlink_to(tracked)
+
+        atomic_write_text(link, "new")
+
+        assert link.is_symlink(), "the dotfiles link must survive the write"
+        assert tracked.read_text(encoding="utf-8") == "new"
+        assert [p.name for p in repo.iterdir()] == [".claude.json"]
+        assert [p.name for p in live.iterdir()] == [".claude.json"]
+
+    def test_follows_a_relative_two_hop_chain(self, tmp_path):
+        (tmp_path / "real").mkdir()
+        final = tmp_path / "real" / "final.json"
+        final.write_text("old")
+        (tmp_path / "hop2").symlink_to("real/final.json")
+        (tmp_path / "hop1").symlink_to("hop2")
+
+        atomic_write_text(tmp_path / "hop1", "new")
+
+        assert (tmp_path / "hop1").is_symlink()
+        assert (tmp_path / "hop2").is_symlink()
+        assert final.read_text(encoding="utf-8") == "new"
+        assert publish_target(tmp_path / "hop1") == final.resolve()
+
+    @pytest.mark.skipif(
+        not hasattr(os.path, "ALLOW_MISSING"),
+        reason="pre-3.12.11 resolver refuses a dangling link",
+    )
+    def test_dangling_link_writes_where_it_points(self, tmp_path):
+        (tmp_path / "gone").mkdir()
+        link = tmp_path / ".claude.json"
+        link.symlink_to(tmp_path / "gone" / "config.json")
+
+        atomic_write_text(link, "{}")
+
+        assert link.is_symlink()
+        assert (tmp_path / "gone" / "config.json").read_text(encoding="utf-8") == "{}"
+        assert [p.name for p in (tmp_path / "gone").iterdir()] == ["config.json"]
+
+    def test_follow_symlinks_false_replaces_the_link(self, tmp_path):
+        target = tmp_path / "elsewhere.json"
+        target.write_text("untouched")
+        link = tmp_path / "out.cswap"
+        link.symlink_to(target)
+
+        atomic_write_text(link, "export", follow_symlinks=False)
+
+        assert not link.is_symlink()
+        assert link.read_text(encoding="utf-8") == "export"
+        assert target.read_text(encoding="utf-8") == "untouched"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["elsewhere.json", "out.cswap"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink loop semantics")
+    def test_loop_raises_eloop_and_writes_nothing(self, tmp_path):
+        loop = tmp_path / "loop.json"
+        loop.symlink_to("loop.json")
+
+        with pytest.raises(OSError) as info:
+            atomic_write_text(loop, "{}")
+
+        assert info.value.errno == errno.ELOOP
+        assert loop.is_symlink()
+        assert [p.name for p in tmp_path.iterdir()] == ["loop.json"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink loop semantics")
+    def test_loop_hidden_behind_dotdot_is_still_refused(self, tmp_path):
+        """Non-strict realpath would collapse ``loop/..`` lexically and aim
+        the write at ``victim.json``, a file ``open`` cannot even reach."""
+        victim = tmp_path / "victim.json"
+        victim.write_bytes(b"victim")
+        (tmp_path / "loop").symlink_to("loop")
+        config = tmp_path / "config.json"
+        config.symlink_to("loop/../victim.json")
+
+        with pytest.raises(OSError) as info:
+            atomic_write_text(config, "{}")
+
+        assert info.value.errno == errno.ELOOP
+        assert victim.read_bytes() == b"victim"
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            "config.json", "loop", "victim.json",
+        ]
+
+    def test_publish_target_of_a_plain_path_is_the_path(self, tmp_path):
+        p = tmp_path / "plain.json"
+        assert publish_target(p) == p
+        p.write_text("x")
+        assert publish_target(p) == p
+
+    def test_strict_fallback_refuses_a_dangling_link(self, tmp_path, monkeypatch):
+        """On a 3.12 release without ``ALLOW_MISSING`` the resolver runs
+        fully strict: a dangling link is refused rather than guessed, while
+        an existing target is still written through."""
+        monkeypatch.setattr("claude_swap.fsutil._RESOLVE_STRICT", True)
+        (tmp_path / "gone").mkdir()
+        dangling = tmp_path / "dangling.json"
+        dangling.symlink_to(tmp_path / "gone" / "config.json")
+
+        with pytest.raises(FileNotFoundError):
+            atomic_write_text(dangling, "{}")
+
+        assert dangling.is_symlink()
+        assert list((tmp_path / "gone").iterdir()) == []
+        assert not list(tmp_path.glob("*.tmp"))
+
+        tracked = tmp_path / "tracked.json"
+        tracked.write_text("old")
+        link = tmp_path / "link.json"
+        link.symlink_to(tracked)
+        atomic_write_text(link, "new")
+        assert link.is_symlink()
+        assert tracked.read_text(encoding="utf-8") == "new"

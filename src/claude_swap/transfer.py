@@ -107,12 +107,19 @@ def _atomic_write_file(path: Path, content: str) -> None:
     chmod sequence leaves the temp file at the umask-derived default mode
     (typically world-readable) for the window between creation and the chmod
     call. The shared ``fsutil.atomic_write_text`` is that pattern.
+
+    ``follow_symlinks=False``: the destination is a path the user typed, often
+    under a shared directory such as ``/tmp``, and a symlink planted there by
+    another local user must not redirect an export full of refresh tokens onto
+    a file of their choosing. The rename replaces the link itself (in a sticky
+    directory a foreign entry makes that rename fail, which is the right
+    outcome).
     """
     if path.is_dir():
         raise TransferError(
             f"export destination must be a file path, not a directory: {path}"
         )
-    atomic_write_text(path, content)
+    atomic_write_text(path, content, follow_symlinks=False)
 
 
 def _slim_config(config_obj: dict, label: str) -> dict:

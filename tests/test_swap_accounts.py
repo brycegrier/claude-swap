@@ -338,6 +338,28 @@ class TestSwapAccounts:
         assert target.stat().st_mode & 0o777 == 0o600
         assert not list(temp_home.glob(".claude.*.tmp"))
 
+    def test_write_json_keeps_a_symlinked_config(self, temp_home: Path):
+        """A dotfiles-managed ~/.claude.json is a symlink. The publish must
+        land on its target and leave the link in place, as Claude Code's own
+        writer does; renaming onto the link would detach it silently (#192)."""
+        dotfiles = temp_home / "dotfiles"
+        dotfiles.mkdir()
+        tracked = dotfiles / "claude.json"
+        tracked.write_text("{}", encoding="utf-8")
+        link = temp_home / ".claude.json"
+        link.unlink(missing_ok=True)
+        link.symlink_to(tracked)
+
+        ClaudeAccountSwitcher()._write_json(
+            link, {"oauthAccount": {"emailAddress": "a@example.com"}}
+        )
+
+        assert link.is_symlink()
+        written = json.loads(tracked.read_text(encoding="utf-8"))
+        assert written["oauthAccount"]["emailAddress"] == "a@example.com"
+        assert not list(dotfiles.glob("*.tmp"))
+        assert not list(temp_home.glob("*.tmp"))
+
     def test_write_json_failed_publish_strands_nothing(
         self, temp_home: Path, sample_sequence_data: dict, monkeypatch
     ):

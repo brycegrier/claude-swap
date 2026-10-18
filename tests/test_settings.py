@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import stat
+import os
 import sys
 from pathlib import Path
 
@@ -353,6 +354,10 @@ class TestAtomicWriteThroughSymlink:
         assert link.is_symlink(), "the dotfiles link must survive the write"
         assert json.loads(tracked.read_text()) == {"written": "through"}
 
+    @pytest.mark.skipif(
+        not hasattr(os.path, "ALLOW_MISSING"),
+        reason="pre-3.12.11 resolver refuses a dangling link",
+    )
     def test_dangling_link_writes_where_it_points(self, tmp_path):
         target = tmp_path / "gone" / "settings.json"
         link = tmp_path / "settings.json"
