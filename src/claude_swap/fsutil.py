@@ -7,8 +7,10 @@ the paths/models/usage_store import cycle.
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -99,3 +101,90 @@ def replace_with_retry(
                 raise
             time.sleep(delay)
             delay = min(delay * 2, 0.25)
+
+
+# Filesystems that do not implement fsync answer one of these; the write goes
+# ahead without the durability it would otherwise buy (Claude Code's own
+# writer tolerates the same set). Anything else -- EIO above all -- raises.
+_FSYNC_UNSUPPORTED = frozenset(
+    code
+    for code in (
+        getattr(errno, name, None)
+        for name in ("EINVAL", "ENOTSUP", "EOPNOTSUPP", "ENOSYS")
+    )
+    if code is not None
+)
+
+
+def atomic_write_bytes(
+    path: os.PathLike | str, data: bytes, *, mode: int = 0o600
+) -> None:
+    """Publish ``data`` at ``path`` by temp file + rename.
+
+    ``mkstemp`` creates the temp beside the target (0600 from creation, same
+    filesystem, so the rename is atomic); the bytes are written, ``mode`` is
+    set on the open descriptor, the content is fsynced, and the temp is
+    renamed over the target. A reader sees the old file or the new one, never
+    a truncated or partial one -- which is what ``Path.write_text`` (O_TRUNC,
+    then write) cannot promise, and why the switch rollback must not use it:
+    Claude Code watches ``~/.claude.json`` and treats a torn read as a
+    corrupted config (#419).
+
+    Precisely what is promised: a failure before the rename leaves the
+    destination exactly as it was and removes the temp; no further ordinary
+    fallible operation follows the rename (a signal can still interrupt the
+    caller once the file is published). The content is fsynced before it is
+    published, so a crash cannot leave an empty new file where an old one was.
+    The durability of the rename itself is the directory's business and is
+    not promised: a crash right after it can lose a newly created file or
+    show the previous version of an existing one. Where the filesystem
+    reports fsync as unsupported, the write proceeds without that guarantee.
+    One cleanup gap is accepted: a signal landing inside ``mkstemp`` between
+    the create and the return of its name strands one 0600 temp.
+
+    Not done here on purpose: no ``mkdir`` of parents (callers that need it do
+    it first), and no in-place fallback when the rename is refused -- a
+    bind-mounted target answers EBUSY, the write fails, the destination is
+    untouched. Claude Code's own writer does fall back to an in-place rewrite
+    there (keeping its temp until the rewrite lands); that is the shape to copy
+    if anyone ever asks for it, in this one place.
+    """
+    target = Path(path)
+    fd, tmp = tempfile.mkstemp(
+        dir=str(target.parent), prefix=f"{target.name}.", suffix=".tmp"
+    )
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written == 0:
+                raise OSError(errno.EIO, "write made no progress", tmp)
+            view = view[written:]
+        if sys.platform != "win32":
+            os.fchmod(fd, mode)
+        try:
+            os.fsync(fd)
+        except OSError as e:
+            if e.errno not in _FSYNC_UNSUPPORTED:
+                raise
+        os.close(fd)
+        fd = -1
+        replace_with_retry(tmp, target)
+    except BaseException:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_text(
+    path: os.PathLike | str, text: str, *, mode: int = 0o600
+) -> None:
+    """:func:`atomic_write_bytes` for UTF-8 text."""
+    atomic_write_bytes(path, text.encode("utf-8"), mode=mode)

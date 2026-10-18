@@ -1,5 +1,6 @@
 """Tests for `cswap swap` (ClaudeAccountSwitcher.swap_accounts)."""
 
+import errno
 import json
 import os
 import sys
@@ -272,21 +273,21 @@ class TestSwapAccounts:
     def test_write_json_publishes_only_after_chmod(
         self, temp_home: Path, sample_sequence_data: dict
     ):
-        """chmod runs on the temp file, making the rename the final commit —
-        a chmod failure must abort *without* publishing, otherwise callers
-        would roll files back around already-committed metadata."""
+        """The mode goes on the temp's descriptor, making the rename the final
+        commit — a mode failure must abort *without* publishing, otherwise
+        callers would roll files back around already-committed metadata."""
         if sys.platform == "win32":
-            pytest.skip("_write_json skips chmod on Windows (no POSIX file modes)")
+            pytest.skip("_write_json skips the mode call on Windows (no POSIX file modes)")
         switcher = ClaudeAccountSwitcher()
         self._write(switcher, sample_sequence_data)
         before = switcher.sequence_file.read_text(encoding="utf-8")
 
-        def failing_chmod(path, mode):
-            raise OSError("chmod denied (injected)")
+        def failing_fchmod(fd, mode):
+            raise OSError("fchmod denied (injected)")
 
         # Scoped context: see H-1 comment above.
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr("claude_swap.switcher.os.chmod", failing_chmod)
+            mp.setattr("claude_swap.fsutil.os.fchmod", failing_fchmod)
             with pytest.raises(OSError):
                 switcher._write_json(switcher.sequence_file, {"x": 1})
 
@@ -318,9 +319,9 @@ class TestSwapAccounts:
     ):
         """The temp file holds the whole payload (``~/.claude.json`` can carry
         ``primaryApiKey`` and MCP env secrets), so it has to be 0600 when it
-        is created. With chmod neutralised, the published file carries the
-        mode the temp file was created with: a write-then-chmod writer shows
-        up here as 0644 under the usual 022 umask."""
+        is created. With the mode call neutralised, the published file carries
+        the mode the temp file was created with: a write-then-chmod writer
+        shows up here as 0644 under the usual 022 umask."""
         if sys.platform == "win32":
             pytest.skip("POSIX file modes")
         switcher = ClaudeAccountSwitcher()
@@ -329,13 +330,49 @@ class TestSwapAccounts:
         old_umask = os.umask(0o022)
         try:
             with pytest.MonkeyPatch.context() as mp:
-                mp.setattr("claude_swap.switcher.os.chmod", lambda *a, **k: None)
+                mp.setattr("claude_swap.fsutil.os.fchmod", lambda *a, **k: None)
                 switcher._write_json(target, {"primaryApiKey": "sk-test"})
         finally:
             os.umask(old_umask)
 
         assert target.stat().st_mode & 0o777 == 0o600
         assert not list(temp_home.glob(".claude.*.tmp"))
+
+    def test_write_json_failed_publish_strands_nothing(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """A rename the destination refuses (a bind-mounted ~/.claude.json
+        answers EBUSY) must leave the target as it was and no temp beside it:
+        the temp holds the whole payload, credentials included."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        before = switcher.sequence_file.read_text(encoding="utf-8")
+
+        def refuse(src, dst, **kwargs):
+            raise OSError(errno.EBUSY, "Device or resource busy")
+
+        monkeypatch.setattr("claude_swap.fsutil.replace_with_retry", refuse)
+        with pytest.raises(OSError):
+            switcher._write_json(switcher.sequence_file, {"x": 1})
+
+        assert switcher.sequence_file.read_text(encoding="utf-8") == before
+        assert not list(switcher.sequence_file.parent.glob("*.tmp"))
+
+    def test_write_json_refuses_nan(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """``json.dumps`` would emit ``NaN``, which Claude Code's JSON.parse
+        rejects — in ~/.claude.json that is a corrupted config. Refused at
+        write time, file untouched, no temp."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        before = switcher.sequence_file.read_text(encoding="utf-8")
+
+        with pytest.raises(ConfigError, match="invalid JSON"):
+            switcher._write_json(switcher.sequence_file, {"x": float("nan")})
+
+        assert switcher.sequence_file.read_text(encoding="utf-8") == before
+        assert not list(switcher.sequence_file.parent.glob("*.tmp"))
 
     def test_swap_same_email_one_sided_clears_destination(
         self, temp_home: Path, sample_sequence_data_with_org: dict

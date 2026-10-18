@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 from pathlib import Path
 
 import pytest
 
-from claude_swap.fsutil import read_text_with_retry, replace_with_retry
+from claude_swap.fsutil import (
+    atomic_write_bytes,
+    atomic_write_text,
+    read_text_with_retry,
+    replace_with_retry,
+)
 
 
 class TestReplaceWithRetry:
@@ -284,3 +290,114 @@ class TestStrictRosterReadBranches:
         p = tmp_path / "config.json"
         p.write_text("[1, 2, 3]")
         assert self._switcher(tmp_path)._read_json(p) is None
+
+
+class TestAtomicWrite:
+    """``atomic_write_text`` is how every published file lands: temp beside
+    the target, fsync, rename. The switch rollback restores ``~/.claude.json``
+    through it because ``Path.write_text`` truncates the live file before it
+    writes, and Claude Code, which watches that file, treats a torn read as a
+    corrupted config (#419)."""
+
+    def test_publishes_by_rename(self, tmp_path):
+        target = tmp_path / ".claude.json"
+        target.write_text("old")
+        before = target.stat().st_ino
+        atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "new"
+        assert list(tmp_path.iterdir()) == [target]
+        if sys.platform != "win32":
+            assert target.stat().st_ino != before  # published, not rewritten
+            assert target.stat().st_mode & 0o777 == 0o600
+
+    def test_failed_publish_leaves_destination_untouched(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / ".claude.json"
+        target.write_text("old")
+
+        def refuse(src, dst, **kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr("claude_swap.fsutil.replace_with_retry", refuse)
+        with pytest.raises(OSError):
+            atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "old"
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_interrupted_write_leaves_no_temp(self, tmp_path, monkeypatch):
+        """A Ctrl-C is not an OSError; the temp must still go. Injected at
+        fsync, the one call in the sequence only this writer makes."""
+        target = tmp_path / ".claude.json"
+        target.write_text("old")
+
+        def interrupt(fd):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("claude_swap.fsutil.os.fsync", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "old"
+        assert list(tmp_path.iterdir()) == [target]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_temp_is_private_from_creation(self, tmp_path, monkeypatch):
+        """With the mode call neutralised the published mode is the one the
+        temp was created with: a write-then-chmod writer shows up as 0644."""
+        monkeypatch.setattr("claude_swap.fsutil.os.fchmod", lambda *a, **k: None)
+        old_umask = os.umask(0o022)
+        try:
+            atomic_write_text(tmp_path / "secret.json", "{}")
+        finally:
+            os.umask(old_umask)
+        assert (tmp_path / "secret.json").stat().st_mode & 0o777 == 0o600
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_failing_mode_call_aborts_before_publishing(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "secret.json"
+        target.write_text("old")
+
+        def refuse(fd, mode):
+            raise PermissionError("fchmod denied (injected)")
+
+        monkeypatch.setattr("claude_swap.fsutil.os.fchmod", refuse)
+        with pytest.raises(PermissionError):
+            atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "old"
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_fsync_unsupported_is_tolerated_other_errors_are_not(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "x.json"
+        target.write_text("old")
+
+        def unsupported(fd):
+            raise OSError(errno.EINVAL, "fsync not supported here")
+
+        monkeypatch.setattr("claude_swap.fsutil.os.fsync", unsupported)
+        atomic_write_text(target, "new")
+        assert target.read_text(encoding="utf-8") == "new"
+
+        def broken(fd):
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr("claude_swap.fsutil.os.fsync", broken)
+        with pytest.raises(OSError):
+            atomic_write_text(target, "newer")
+        assert target.read_text(encoding="utf-8") == "new"
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_missing_parent_is_not_created(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            atomic_write_text(tmp_path / "missing" / "x.json", "{}")
+        assert not (tmp_path / "missing").exists()
+
+    def test_bytes_round_trip(self, tmp_path):
+        target = tmp_path / "blob.bin"
+        payload = bytes(range(256)) * 300
+        atomic_write_bytes(target, payload)
+        assert target.read_bytes() == payload
+        assert list(tmp_path.iterdir()) == [target]
