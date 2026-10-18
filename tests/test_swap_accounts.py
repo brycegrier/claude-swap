@@ -645,3 +645,41 @@ class TestSwapUnreadableSourceIsNotAbsent:
         data = switcher._get_sequence_data()
         assert data["accounts"]["1"]["email"] == "account2@example.com"
         assert data["accounts"]["2"]["email"] == "account1@example.com"
+
+
+def test_staging_interrupted_mid_write_leaves_no_files(
+    temp_home: Path, monkeypatch
+):
+    """A Ctrl-C while a staging copy is being written must remove what this
+    call created: a leftover holds plaintext credentials and wedges the next
+    same-email swap behind a "may be the only surviving copy" refusal. The
+    interrupt lands inside ``os.fdopen``, before a file object owns the
+    descriptor, so the production handler must close it as well (on Windows
+    an open file cannot be unlinked) -- the injection deliberately does not."""
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    real_fdopen = os.fdopen
+    real_close = os.close
+    opened: list[int] = []
+    closed: list[int] = []
+
+    def fdopen_then_interrupt(fd, *args, **kwargs):
+        opened.append(fd)
+        if len(opened) == 2:  # first copy written in full, second just created
+            raise KeyboardInterrupt
+        return real_fdopen(fd, *args, **kwargs)
+
+    def spying_close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr("claude_swap.switcher.os.fdopen", fdopen_then_interrupt)
+    monkeypatch.setattr("claude_swap.switcher.os.close", spying_close)
+    with pytest.raises(KeyboardInterrupt):
+        switcher._stage_overlap_material(
+            {"1": ("creds-one", "config-one"), "2": ("creds-two", "")}
+        )
+
+    assert len(opened) == 2
+    assert opened[1] in closed, "the descriptor fdopen never took over leaked"
+    assert not list(switcher.credentials_dir.glob(".swap-staging-*"))

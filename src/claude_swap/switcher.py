@@ -1259,7 +1259,8 @@ class ClaudeAccountSwitcher:
         """
         for path in staging.values():
             try:
-                path.unlink()
+                # missing_ok: a claim the create never reached holds nothing.
+                path.unlink(missing_ok=True)
             except OSError as e:
                 self._logger.error(f"Could not remove swap staging copy: {e}")
                 warning(
@@ -1289,13 +1290,38 @@ class ClaudeAccountSwitcher:
         whose mid-write failures this protects against).
         """
         staged: dict[str, Path] = {}
+        fd = -1
+
+        def abort() -> None:
+            # Remove only what THIS call created -- after closing a descriptor
+            # no file object took over: on Windows an open file cannot be
+            # unlinked, so the discard would otherwise fail exactly then.
+            nonlocal fd
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = -1
+            self._discard_staging(staged)
+
         try:
             for num, (creds, config) in material.items():
                 for kind, content in (("creds", creds), ("config", config)):
                     if not content:
                         continue
                     path = self.credentials_dir / f".swap-staging-{kind}-{num}.json"
-                    if path.exists():
+                    # Claimed BEFORE the create: a signal delivered inside
+                    # os.open raises once the file already exists, so a record
+                    # made afterwards can miss a file that is there (#268).
+                    key = f"{kind}-{num}"
+                    staged[key] = path
+                    try:
+                        fd = os.open(
+                            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                        )
+                    except FileExistsError:
+                        del staged[key]  # not ours: never remove it
                         raise ConfigError(
                             f"Found leftover staging from an interrupted swap: "
                             f"{path}. It holds that slot's pre-swap credentials "
@@ -1303,19 +1329,26 @@ class ClaudeAccountSwitcher:
                             f"accounts still work (`cswap list`), then delete "
                             f"the file and retry."
                         )
-                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh = os.fdopen(fd, "w", encoding="utf-8")
+                    fd = -1  # the file object owns the descriptor now
+                    with fh:
                         fh.write(content)
-                    staged[f"{kind}-{num}"] = path
         except ConfigError:
-            # Leftover found: remove only what THIS call created.
-            self._discard_staging(staged)
+            # Leftover found.
+            abort()
             raise
         except OSError as e:
-            self._discard_staging(staged)
+            abort()
             raise ConfigError(
                 f"Could not stage swap material, nothing was changed: {e}"
             )
+        except BaseException:
+            # A Ctrl-C reaches neither handler above, and the caller never
+            # receives the dict to clean up: same policy. A leftover would
+            # hold plaintext credentials and wedge the next same-email swap
+            # behind the refusal above.
+            abort()
+            raise
         return staged
 
     def _swap_session_dirs(
