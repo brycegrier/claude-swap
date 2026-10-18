@@ -12798,3 +12798,26 @@ class TestSwitchTransactionRollback:
         assert tx.rollback(MagicMock()) is False
         assert config_path.read_text() == '{"half": "written"}'
         assert list(tmp_path.iterdir()) == [config_path]
+
+
+class TestSalvageCopyMode:
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_salvage_copy_is_private_from_creation(
+        self, temp_home: Path, monkeypatch,
+    ):
+        """The aside copy of an unparseable ~/.claude.json can hold
+        primaryApiKey: it must be 0600 from the instant it exists, not
+        world-readable until a later chmod. With the mode call neutralised,
+        the published mode is the one the file was created with."""
+        config_path = temp_home / ".claude.json"
+        config_path.write_text('{"primaryApiKey": "sk-test", "torn":')
+        switcher = ClaudeAccountSwitcher()
+        monkeypatch.setattr("claude_swap.fsutil.os.fchmod", lambda *a, **k: None)
+        old_umask = os.umask(0o022)
+        try:
+            salvage = switcher._salvage_unreadable(config_path, False, [])
+        finally:
+            os.umask(old_umask)
+        assert salvage.read_bytes() == config_path.read_bytes()
+        assert salvage.stat().st_mode & 0o777 == 0o600
+        assert not list(temp_home.glob("*.tmp"))

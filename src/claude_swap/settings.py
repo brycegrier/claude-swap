@@ -17,12 +17,11 @@ import logging
 import math
 import os
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap.exceptions import ConfigError
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import atomic_write_text
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
@@ -534,19 +533,4 @@ def atomic_write_json(path: Path, data: dict) -> None:
     if sys.platform != "win32":
         # `path.parent`, NOT the target's: see the docstring.
         os.chmod(path.parent, 0o700)
-    fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
-    try:
-        os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
-        os.close(fd)
-        fd = -1
-        replace_with_retry(tmp_path, str(target))
-        if sys.platform != "win32":
-            os.chmod(str(target), 0o600)
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(target, json.dumps(data, indent=2))

@@ -374,7 +374,6 @@ class TestAtomicWriteThroughSymlink:
         another mount — the write fails outright. Assert the placement
         directly; staging two filesystems in a unit test is not portable."""
         import tempfile
-        from claude_swap import settings as S
         repo = tmp_path / "repo"; repo.mkdir()
         live = tmp_path / "live"; live.mkdir()
         tracked = repo / "settings.json"; tracked.write_text("{}")
@@ -382,7 +381,7 @@ class TestAtomicWriteThroughSymlink:
         seen = []
         real_mkstemp = tempfile.mkstemp
         monkeypatch.setattr(
-            S.tempfile, "mkstemp",
+            tempfile, "mkstemp",
             lambda *a, **kw: (seen.append(kw.get("dir")), real_mkstemp(*a, **kw))[1],
         )
 
