@@ -405,3 +405,25 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+class TestNonFiniteSettings:
+    """json.loads accepts NaN/Infinity, and min/max pass NaN through, so the
+    clamp treats a non-finite float as garbage (a NaN line would never be
+    crossed), while an int too large for a float still clamps."""
+
+    @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+    def test_non_finite_numbers_fall_back_to_defaults(self, tmp_path: Path, literal):
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"threshold": %s}}' % literal
+        )
+        assert load_settings(tmp_path).threshold == AutoSwitchSettings().threshold
+
+    def test_an_integer_too_large_for_a_float_still_clamps(self, tmp_path: Path):
+        # Python ints are unbounded; isfinite() on one past float range raises
+        # OverflowError. The clamp must keep answering 99.9.
+        huge = "1" + "0" * 400
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"threshold": %s}}' % huge
+        )
+        assert load_settings(tmp_path).threshold == 99.9

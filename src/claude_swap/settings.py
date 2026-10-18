@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 import sys
 import tempfile
@@ -225,7 +226,16 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
     """Clamp values into the SETTING_SPECS ranges; bad types → the default."""
 
     def num(value, default: float, lo: float, hi: float) -> float:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        # json.loads accepts NaN/Infinity literals and min/max pass NaN
+        # through unclamped, so a non-finite float is garbage too (a NaN line
+        # would silently never be crossed). Floats only: an int is always
+        # finite, and isfinite() would overflow on one too large for a float
+        # — the clamp below handles that without ever converting it.
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or (isinstance(value, float) and not math.isfinite(value))
+        ):
             return default
         return float(min(max(value, lo), hi))
 
