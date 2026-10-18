@@ -123,6 +123,13 @@ _FSYNC_UNSUPPORTED = frozenset(
 # Module-level so a test can pin the fallback without touching ``os.path``.
 _RESOLVE_STRICT = getattr(os.path, "ALLOW_MISSING", True)
 
+# NAME_MAX is 255 bytes on every filesystem cswap meets, and ``mkstemp`` adds
+# eight random characters plus ``.tmp`` to the prefix. A prefix carrying the
+# whole destination name would push a legal 243+ character destination over
+# the limit -- ENAMETOOLONG at the temp, for a file that itself fits. Keep
+# the association readable for ordinary names and bounded for long ones.
+_TEMP_PREFIX_CHARS = 40
+
 
 def publish_target(path: os.PathLike | str) -> Path:
     """Where a publish to ``path`` lands: ``path`` itself or, for a symlink,
@@ -192,7 +199,9 @@ def atomic_write_bytes(
     """
     target = publish_target(path) if follow_symlinks else Path(path)
     fd, tmp = tempfile.mkstemp(
-        dir=str(target.parent), prefix=f"{target.name}.", suffix=".tmp"
+        dir=str(target.parent),
+        prefix=f"{target.name[:_TEMP_PREFIX_CHARS]}.",
+        suffix=".tmp",
     )
     try:
         view = memoryview(data)

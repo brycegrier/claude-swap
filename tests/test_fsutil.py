@@ -528,3 +528,21 @@ class TestAtomicWriteSymlinks:
         atomic_write_text(link, "new")
         assert link.is_symlink()
         assert tracked.read_text(encoding="utf-8") == "new"
+
+
+class TestAtomicWriteTempName:
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="MAX_PATH turns a 251-character name into a path-length question",
+    )
+    def test_a_destination_name_near_name_max_still_publishes(self, tmp_path):
+        """The temp carries a bounded slice of the destination name: a legal
+        251-character destination must not fail with ENAMETOOLONG at the temp
+        (mkstemp adds eight random characters and ``.tmp`` to the prefix)."""
+        target = tmp_path / ("x" * 245 + ".cswap")
+        target.write_text("old")
+
+        atomic_write_text(target, "new")
+
+        assert target.read_text(encoding="utf-8") == "new"
+        assert [p.name for p in tmp_path.iterdir()] == [target.name]
