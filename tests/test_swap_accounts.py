@@ -683,3 +683,44 @@ def test_staging_interrupted_mid_write_leaves_no_files(
     assert len(opened) == 2
     assert opened[1] in closed, "the descriptor fdopen never took over leaked"
     assert not list(switcher.credentials_dir.glob(".swap-staging-*"))
+
+
+def test_staging_interrupted_after_fdopen_leaves_no_files(
+    temp_home: Path, monkeypatch
+):
+    """The same interruption landing inside the write, once the file object
+    owns the descriptor: the with block must have closed it before the
+    discard runs (on Windows an open file cannot be unlinked)."""
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    real_fdopen = os.fdopen
+    owned: list = []
+
+    class InterruptingWriter:
+        def __init__(self, fh):
+            self.fh = fh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.fh.close()
+            return False
+
+        def write(self, text):
+            raise KeyboardInterrupt
+
+    def fdopen_interrupting_the_second(fd, *args, **kwargs):
+        fh = real_fdopen(fd, *args, **kwargs)
+        owned.append(fh)
+        return InterruptingWriter(fh) if len(owned) == 2 else fh
+
+    monkeypatch.setattr("claude_swap.switcher.os.fdopen", fdopen_interrupting_the_second)
+    with pytest.raises(KeyboardInterrupt):
+        switcher._stage_overlap_material(
+            {"1": ("creds-one", "config-one"), "2": ("creds-two", "")}
+        )
+
+    assert len(owned) == 2
+    assert all(fh.closed for fh in owned)
+    assert not list(switcher.credentials_dir.glob(".swap-staging-*"))
