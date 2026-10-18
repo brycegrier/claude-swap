@@ -430,7 +430,9 @@ class TestAtomicWriteSymlinks:
         (tmp_path / "real").mkdir()
         final = tmp_path / "real" / "final.json"
         final.write_text("old")
-        (tmp_path / "hop2").symlink_to("real/final.json")
+        # Native separator: Windows rejects a forward slash inside a reparse
+        # point (WinError 123 from realpath), which is the link, not the writer.
+        (tmp_path / "hop2").symlink_to(Path("real") / "final.json")
         (tmp_path / "hop1").symlink_to("hop2")
 
         atomic_write_text(tmp_path / "hop1", "new")
