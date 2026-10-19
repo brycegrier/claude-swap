@@ -391,6 +391,10 @@ class TestAtomicWrite:
         assert target.read_text(encoding="utf-8") == "new"
         assert list(tmp_path.iterdir()) == [target]
 
+    def test_suite_runs_with_fsync_stubbed(self):
+        """conftest stubs ``os.fsync``; the real one rejects a bad descriptor."""
+        os.fsync(-1)
+
     def test_missing_parent_is_not_created(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             atomic_write_text(tmp_path / "missing" / "x.json", "{}")
