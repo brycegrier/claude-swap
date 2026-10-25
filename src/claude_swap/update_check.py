@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 import urllib.request
 from pathlib import Path
 from typing import NamedTuple
@@ -92,30 +93,122 @@ def _detect_install_method() -> str | None:
     return None
 
 
+class _Cooldown(NamedTuple):
+    """An exclude-newer setting as uv spells it, and where the user set it."""
+
+    value: str  # "P14D", "14 days", "2026-10-11T00:36:21Z"
+    source: str  # 'uv-receipt.toml: exclude-newer-span = "P14D"'
+
+
+def _uv_cooldown() -> _Cooldown | None:
+    """The release cooldown ``uv tool upgrade`` applies to this install.
+
+    uv records ``--exclude-newer`` in the tool receipt and reapplies it on
+    every upgrade. A relative setting ("14 days") is stored as
+    ``exclude-newer-span`` next to the absolute cutoff of install time, and
+    the span is what uv recomputes from. ``UV_EXCLUDE_NEWER`` in the
+    environment overrides the receipt, as it does for uv itself.
+    """
+    env_value = os.environ.get("UV_EXCLUDE_NEWER", "").strip()
+    if env_value:
+        return _Cooldown(env_value, f"UV_EXCLUDE_NEWER={env_value}")
+    try:
+        with (Path(sys.prefix) / "uv-receipt.toml").open("rb") as fh:
+            options = tomllib.load(fh).get("tool", {}).get("options", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    if not isinstance(options, dict):
+        return None
+    for key in ("exclude-newer-span", "exclude-newer"):
+        value = options.get(key)
+        if isinstance(value, str):
+            return _Cooldown(value, f'uv-receipt.toml: {key} = "{value}"')
+    return None
+
+
+def _uv_latest_version(current_version: str, cooldown: _Cooldown | None) -> str | None:
+    """The newest claude-swap release uv would install into this environment.
+
+    ``uv pip list --outdated`` resolves against the index the way ``uv tool
+    upgrade`` does once it is handed the same exclude-newer setting, so the
+    version it reports is one uv can actually install. Returns the current
+    version when nothing newer is visible and None when uv is missing or
+    fails. The environment variable is dropped so that the cooldown passed
+    here is the only one uv sees.
+    """
+    cmd = ["uv", "pip", "list", "--outdated", "--format", "json", "--python", sys.executable]
+    if cooldown is not None:
+        cmd += ["--exclude-newer", cooldown.value]
+    env = {k: v for k, v in os.environ.items() if k != "UV_EXCLUDE_NEWER"}
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, env=env, check=True
+        )
+        rows = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    for row in rows:
+        if row.get("name") == "claude-swap":
+            latest = row.get("latest_version")
+            return latest if isinstance(latest, str) else None
+    return current_version
+
+
+def _pypi_latest_version() -> str | None:
+    """PyPI's latest release, for installs that uv does not manage."""
+    try:
+        req = urllib.request.Request(PYPI_URL)
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read().decode())
+        return data["info"]["version"]
+    except Exception:
+        return None
+
+
+def _latest_version(current_version: str, method: str | None) -> str | None:
+    """The newest release the user's package manager will actually install."""
+    if method == "uv":
+        return _uv_latest_version(current_version, _uv_cooldown())
+    return _pypi_latest_version()
+
+
+def held_back_release_notice(current_version: str) -> str | None:
+    """Explain a release that uv's cooldown keeps ``uv tool upgrade`` from seeing.
+
+    uv prints "Nothing to upgrade" whether the install is current or the
+    newest release is simply younger than the cooldown, and the user cannot
+    tell the two apart. When a cooldown is set, this asks uv what it would
+    install without one and names the setting that is in the way.
+    """
+    cooldown = _uv_cooldown()
+    if cooldown is None:
+        return None
+    latest = _uv_latest_version(current_version, None)
+    try:
+        if latest is None or not _is_newer(latest, current_version):
+            return None
+    except ValueError:
+        return None
+    return (
+        f"claude-swap {latest} is on PyPI, but this install has a release cooldown\n"
+        f"  ({cooldown.source}) that hides it from uv tool upgrade.\n"
+        "  To upgrade now and drop the cooldown: uv tool install claude-swap --reinstall"
+    )
+
+
 def check_for_update(current_version: str) -> str | None:
     """Return a notification string if a newer version exists, else None."""
     try:
-        latest_version = None
-
-        # Try reading cache
+        method = _detect_install_method()
         cached_data = read_cache(CACHE_PATH, CACHE_TTL)
-        if cached_data is not MISSING:
+        if cached_data is not MISSING and isinstance(cached_data, str | None):
             latest_version = cached_data
         else:
-            # Fetch from PyPI
-            try:
-                req = urllib.request.Request(PYPI_URL)
-                with urllib.request.urlopen(req, timeout=2) as resp:
-                    data = json.loads(resp.read().decode())
-                latest_version = data["info"]["version"]
-            except Exception:
-                latest_version = None
-
+            latest_version = _latest_version(current_version, method)
             # Write cache regardless of success/failure
             write_cache(CACHE_PATH, latest_version)
 
         if latest_version and _is_newer(latest_version, current_version):
-            method = _detect_install_method()
             direct = {
                 "uv": "uv tool upgrade claude-swap",
                 "pipx": "pipx upgrade claude-swap",
@@ -138,13 +231,20 @@ def check_for_update(current_version: str) -> str | None:
         return None
 
 
-def run_self_upgrade() -> int:
+def run_self_upgrade(current_version: str | None = None) -> int:
     """Run the appropriate upgrade command for the current install method.
 
     Returns the subprocess exit code, or 1 if detection failed or the package
-    manager is missing from PATH.
+    manager is missing from PATH. A uv install with a release cooldown gets
+    told about a release the cooldown hides, since uv itself only reports
+    "Nothing to upgrade".
     """
-    from claude_swap.printer import accent, error
+    from claude_swap.printer import accent, error, warning
+
+    if current_version is None:
+        from claude_swap import __version__
+
+        current_version = __version__
 
     method = _detect_install_method()
     commands = {
@@ -171,14 +271,22 @@ def run_self_upgrade() -> int:
     # releases the lock, so the user can just run the command themselves.
     if sys.platform == "win32":
         print(f"To upgrade claude-swap on Windows, run:\n  {accent(' '.join(cmd))}")
+        if method == "uv":
+            notice = held_back_release_notice(current_version)
+            if notice:
+                warning(notice)
         return 1
 
     try:
         result = subprocess.run(cmd, check=False)
-        return result.returncode
     except FileNotFoundError:
         error(
             f"Detected {method} install but `{cmd[0]}` is not on PATH. "
             "Run the upgrade manually from a shell where it is available."
         )
         return 1
+    if result.returncode == 0 and method == "uv":
+        notice = held_back_release_notice(current_version)
+        if notice:
+            warning(notice)
+    return result.returncode
