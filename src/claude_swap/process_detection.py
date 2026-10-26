@@ -261,7 +261,9 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
     """
     sessions_dir = (claude_dir or get_claude_dir()) / "sessions"
     try:
-        paths = [p for p in sessions_dir.iterdir() if p.name.endswith(".json")]
+        # ``match`` keeps the platform casing the old ``glob`` had (a
+        # ``.JSON`` record still counts on Windows); ``endswith`` would not.
+        paths = [p for p in sessions_dir.iterdir() if p.match("*.json")]
     except FileNotFoundError:
         return [], 0
     except OSError as exc:

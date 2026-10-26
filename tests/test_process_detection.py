@@ -546,6 +546,21 @@ class TestScanSessions:
         destructive step on it permanently."""
         assert scan_sessions(tmp_path) == ([], 0)
 
+    def test_record_name_casing_follows_the_platform_like_glob_did(self, tmp_path):
+        """The listing used to be `glob("*.json")`, which is case-insensitive
+        on Windows and case-sensitive elsewhere; the `iterdir` filter must
+        keep that, so an upper-cased record is still seen where it used to
+        be (the guard errs toward seeing records) and ignored where it was."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        record = _write_session(sessions_dir, os.getpid())
+        record.rename(sessions_dir / f"{os.getpid()}.JSON")
+
+        sessions, unreadable = scan_sessions(tmp_path)
+
+        assert unreadable == 0
+        assert len(sessions) == (1 if sys.platform == "win32" else 0)
+
 
 # --- list_ide_instances ---
 
