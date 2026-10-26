@@ -10,7 +10,7 @@ import sys
 import tomllib
 import urllib.request
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from claude_swap.cache import CACHE_DIR, MISSING, read_cache, write_cache
 
@@ -98,9 +98,20 @@ class _Cooldown(NamedTuple):
 
     value: str  # "P14D", "14 days", "2026-10-11T00:36:21Z"
     source: str  # 'uv-receipt.toml: exclude-newer-span = "P14D"'
+    from_env: bool  # Set through UV_EXCLUDE_NEWER rather than the receipt.
 
 
-def _uv_cooldown() -> _Cooldown | None:
+def _read_receipt() -> dict[str, Any]:
+    """The ``[tool]`` table of this install's uv tool receipt, or ``{}``."""
+    try:
+        with (Path(sys.prefix) / "uv-receipt.toml").open("rb") as fh:
+            tool = tomllib.load(fh).get("tool", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    return tool if isinstance(tool, dict) else {}
+
+
+def _uv_cooldown(receipt: dict[str, Any]) -> _Cooldown | None:
     """The release cooldown ``uv tool upgrade`` applies to this install.
 
     uv records ``--exclude-newer`` in the tool receipt and reapplies it on
@@ -111,19 +122,79 @@ def _uv_cooldown() -> _Cooldown | None:
     """
     env_value = os.environ.get("UV_EXCLUDE_NEWER", "").strip()
     if env_value:
-        return _Cooldown(env_value, f"UV_EXCLUDE_NEWER={env_value}")
-    try:
-        with (Path(sys.prefix) / "uv-receipt.toml").open("rb") as fh:
-            options = tomllib.load(fh).get("tool", {}).get("options", {})
-    except (OSError, tomllib.TOMLDecodeError):
-        return None
+        return _Cooldown(env_value, f"UV_EXCLUDE_NEWER={env_value}", from_env=True)
+    options = receipt.get("options", {})
     if not isinstance(options, dict):
         return None
     for key in ("exclude-newer-span", "exclude-newer"):
         value = options.get(key)
         if isinstance(value, str):
-            return _Cooldown(value, f'uv-receipt.toml: {key} = "{value}"')
+            return _Cooldown(value, f'uv-receipt.toml: {key} = "{value}"', from_env=False)
     return None
+
+
+_PLAIN_WORD_RE = re.compile(r"^[A-Za-z0-9._+=:/@-]+$")
+
+
+def _shell_word(word: str) -> str:
+    """Quote an argument for pasting into sh, cmd or PowerShell alike."""
+    return word if _PLAIN_WORD_RE.match(word) else f'"{word}"'
+
+
+def _requirement_spec(requirement: dict[str, Any], *, primary: bool) -> str | None:
+    """A receipt requirement as the user would spell it on the command line.
+
+    The primary requirement keeps only its extras: a version pin there would
+    reinstall the release the user is trying to move off.
+    """
+    name = requirement.get("name")
+    if not isinstance(name, str):
+        return None
+    extras = requirement.get("extras")
+    spec = name
+    if isinstance(extras, list) and extras:
+        spec += "[" + ",".join(str(extra) for extra in extras) + "]"
+    if primary:
+        return spec
+    specifier = requirement.get("specifier")
+    if isinstance(specifier, str):
+        spec += specifier
+    marker = requirement.get("marker")
+    if isinstance(marker, str):
+        spec += f"; {marker}"
+    return spec
+
+
+def _reinstall_command(receipt: dict[str, Any]) -> str:
+    """``uv tool install --reinstall`` with everything the receipt installed.
+
+    A plain ``uv tool install claude-swap --reinstall`` would drop the
+    ``[menubar]`` extra and every ``--with`` package along with their
+    dependencies, so the command is rebuilt from the receipt's requirement
+    list: the first entry is the tool itself and the rest were ``--with`` or
+    ``--with-editable``.
+    """
+    requirements = receipt.get("requirements")
+    if not isinstance(requirements, list):
+        requirements = []
+    args: list[str] = ["uv", "tool", "install", "--reinstall"]
+    primary_seen = False
+    for requirement in requirements:
+        if not isinstance(requirement, dict):
+            continue
+        editable = requirement.get("editable")
+        if isinstance(editable, str):
+            args += ["--editable" if not primary_seen else "--with-editable", editable]
+            primary_seen = True
+            continue
+        spec = _requirement_spec(requirement, primary=not primary_seen)
+        if spec is None:
+            continue
+        args += [spec] if not primary_seen else ["--with", spec]
+        primary_seen = True
+    if not primary_seen:
+        args.append("claude-swap")
+    return " ".join(_shell_word(arg) for arg in args)
 
 
 def _uv_latest_version(current_version: str, cooldown: _Cooldown | None) -> str | None:
@@ -134,7 +205,10 @@ def _uv_latest_version(current_version: str, cooldown: _Cooldown | None) -> str 
     version it reports is one uv can actually install. Returns the current
     version when nothing newer is visible and None when uv is missing or
     fails. The environment variable is dropped so that the cooldown passed
-    here is the only one uv sees.
+    here is the only one uv sees, and the command runs from the tool's own
+    directory because uv reads the ``uv.toml`` or ``pyproject.toml`` of
+    whatever project the shell happens to be in. ``uv tool upgrade`` does
+    not, so a project's own cutoff must not hide releases from this check.
     """
     cmd = ["uv", "pip", "list", "--outdated", "--format", "json", "--python", sys.executable]
     if cooldown is not None:
@@ -142,7 +216,13 @@ def _uv_latest_version(current_version: str, cooldown: _Cooldown | None) -> str 
     env = {k: v for k, v in os.environ.items() if k != "UV_EXCLUDE_NEWER"}
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=10, env=env, check=True
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
+            check=True,
+            cwd=sys.prefix,
         )
         rows = json.loads(result.stdout)
     except (OSError, subprocess.SubprocessError, ValueError):
@@ -165,11 +245,31 @@ def _pypi_latest_version() -> str | None:
         return None
 
 
-def _latest_version(current_version: str, method: str | None) -> str | None:
-    """The newest release the user's package manager will actually install."""
-    if method == "uv":
-        return _uv_latest_version(current_version, _uv_cooldown())
-    return _pypi_latest_version()
+class _Lookup(NamedTuple):
+    """A version lookup and whether its answer is worth keeping for a day."""
+
+    latest: str | None
+    cache: bool
+
+
+def _latest_version(current_version: str, method: str | None) -> _Lookup:
+    """The newest release the user's package manager will actually install.
+
+    uv is often off PATH when cswap runs under cron or launchd, and a failed
+    lookup cached for a day would keep the interactive runs that follow quiet
+    too. Without a cooldown PyPI answers the same question, so it takes over.
+    With one, PyPI would advertise releases the cooldown hides, so the run
+    stays quiet and leaves the cache alone for the next run to retry.
+    """
+    if method != "uv":
+        return _Lookup(_pypi_latest_version(), cache=True)
+    cooldown = _uv_cooldown(_read_receipt())
+    latest = _uv_latest_version(current_version, cooldown)
+    if latest is not None:
+        return _Lookup(latest, cache=True)
+    if cooldown is None:
+        return _Lookup(_pypi_latest_version(), cache=True)
+    return _Lookup(None, cache=False)
 
 
 def held_back_release_notice(current_version: str) -> str | None:
@@ -178,9 +278,13 @@ def held_back_release_notice(current_version: str) -> str | None:
     uv prints "Nothing to upgrade" whether the install is current or the
     newest release is simply younger than the cooldown, and the user cannot
     tell the two apart. When a cooldown is set, this asks uv what it would
-    install without one and names the setting that is in the way.
+    install without one and names the setting that is in the way. The remedy
+    is a reinstall that keeps the extras and ``--with`` packages, and when
+    the cooldown comes from ``UV_EXCLUDE_NEWER`` the variable has to go
+    first: uv writes it straight back into the fresh receipt otherwise.
     """
-    cooldown = _uv_cooldown()
+    receipt = _read_receipt()
+    cooldown = _uv_cooldown(receipt)
     if cooldown is None:
         return None
     latest = _uv_latest_version(current_version, None)
@@ -189,10 +293,15 @@ def held_back_release_notice(current_version: str) -> str | None:
             return None
     except ValueError:
         return None
+    if cooldown.from_env:
+        remedy = "To upgrade now and drop the cooldown, unset UV_EXCLUDE_NEWER and run:"
+    else:
+        remedy = "To upgrade now and drop the cooldown, run:"
     return (
         f"claude-swap {latest} is on PyPI, but this install has a release cooldown\n"
         f"  ({cooldown.source}) that hides it from uv tool upgrade.\n"
-        "  To upgrade now and drop the cooldown: uv tool install claude-swap --reinstall"
+        f"  {remedy}\n"
+        f"    {_reinstall_command(receipt)}"
     )
 
 
@@ -204,9 +313,12 @@ def check_for_update(current_version: str) -> str | None:
         if cached_data is not MISSING and isinstance(cached_data, str | None):
             latest_version = cached_data
         else:
-            latest_version = _latest_version(current_version, method)
-            # Write cache regardless of success/failure
-            write_cache(CACHE_PATH, latest_version)
+            lookup = _latest_version(current_version, method)
+            latest_version = lookup.latest
+            # A failed PyPI lookup is cached too, so a dead network costs
+            # one timeout a day. A failed uv lookup under a cooldown is not.
+            if lookup.cache:
+                write_cache(CACHE_PATH, latest_version)
 
         if latest_version and _is_newer(latest_version, current_version):
             direct = {

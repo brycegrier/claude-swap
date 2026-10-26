@@ -290,12 +290,19 @@ class _UvInstall:
         monkeypatch.setattr("claude_swap.update_check.sys.platform", "linux")
         monkeypatch.setattr("claude_swap.update_check._detect_install_method", lambda: "uv")
         monkeypatch.delenv("UV_EXCLUDE_NEWER", raising=False)
+        # PyPI is unreachable unless a test says otherwise, so a uv failure
+        # that falls back to it cannot leave the sandbox.
+        monkeypatch.setattr(
+            "claude_swap.update_check.urllib.request.urlopen",
+            MagicMock(side_effect=OSError("network error")),
+        )
 
     @staticmethod
-    def _write_receipt(prefix, options: str) -> None:
+    def _write_receipt(
+        prefix, options: str = "", requirements: str = '{ name = "claude-swap" }'
+    ) -> None:
         (prefix / "uv-receipt.toml").write_text(
-            '[tool]\nrequirements = [{ name = "claude-swap" }]\n\n'
-            f"[tool.options]\n{options}\n"
+            f"[tool]\nrequirements = [{requirements}]\n\n[tool.options]\n{options}\n"
         )
 
     @staticmethod
@@ -352,6 +359,17 @@ class TestUvInstall(_UvInstall):
         assert "UV_EXCLUDE_NEWER" not in mock_run.call_args.kwargs["env"]
 
     @patch("claude_swap.update_check.subprocess.run")
+    def test_asks_uv_from_the_tool_directory(self, mock_run, tmp_path):
+        # uv reads the uv.toml of whatever project the shell is in, and a
+        # project's own exclude-newer would hide releases that `uv tool
+        # upgrade`, which ignores project config, is happy to install.
+        mock_run.return_value = _uv_pip_list(_OUTDATED)
+
+        check_for_update("0.27.2")
+
+        assert mock_run.call_args.kwargs["cwd"] == str(tmp_path)
+
+    @patch("claude_swap.update_check.subprocess.run")
     def test_no_cooldown_passes_no_cutoff(self, mock_run, tmp_path):
         mock_run.return_value = _uv_pip_list(_OUTDATED)
 
@@ -370,17 +388,51 @@ class TestUvInstall(_UvInstall):
         cache = json.loads((tmp_path / "cache.json").read_text())
         assert cache["data"] == "0.27.2"
 
+    @patch("claude_swap.update_check.urllib.request.urlopen")
     @patch("claude_swap.update_check.subprocess.run", side_effect=FileNotFoundError)
-    def test_uv_missing_is_quiet_and_cached(self, mock_run, tmp_path):
-        assert check_for_update("0.27.2") is None
+    def test_uv_missing_without_cooldown_asks_pypi(self, mock_run, mock_urlopen, tmp_path):
+        # `cswap auto --once` under cron or launchd runs without uv on PATH.
+        # Nothing hides releases from this install, so PyPI's answer is the
+        # one uv would have given, and it is cached like any other.
+        mock_urlopen.return_value = _make_pypi_response("0.28.0")
+
+        result = check_for_update("0.27.2")
+
+        assert result is not None
+        assert "(0.28.0)" in result
+        mock_urlopen.assert_called_once()
         cache = json.loads((tmp_path / "cache.json").read_text())
-        assert cache["data"] is None
+        assert cache["data"] == "0.28.0"
+
+    @patch("claude_swap.update_check.subprocess.run", side_effect=FileNotFoundError)
+    def test_uv_missing_with_cooldown_is_quiet_and_retried(self, mock_run, tmp_path):
+        # PyPI would advertise the release the cooldown hides, so the run
+        # stays quiet. Caching that for a day would silence the interactive
+        # runs that follow, which do have uv, so nothing is written.
+        self._write_receipt(tmp_path, 'exclude-newer-span = "P14D"')
+
+        assert check_for_update("0.27.2") is None
+        assert not (tmp_path / "cache.json").exists()
+
+        mock_run.side_effect = None
+        mock_run.return_value = _uv_pip_list(_OUTDATED)
+        assert check_for_update("0.27.2") is not None
+
+    @patch("claude_swap.update_check.urllib.request.urlopen")
+    @patch("claude_swap.update_check.subprocess.run")
+    def test_uv_failure_without_cooldown_asks_pypi(self, mock_run, mock_urlopen, tmp_path):
+        mock_run.side_effect = subprocess.CalledProcessError(2, "uv")
+        mock_urlopen.return_value = _make_pypi_response("0.28.0")
+
+        assert check_for_update("0.27.2") is not None
 
     @patch("claude_swap.update_check.subprocess.run")
-    def test_uv_failure_is_quiet(self, mock_run, tmp_path):
+    def test_uv_and_pypi_both_failing_is_quiet_and_cached(self, mock_run, tmp_path):
         mock_run.side_effect = subprocess.CalledProcessError(2, "uv")
 
         assert check_for_update("0.27.2") is None
+        cache = json.loads((tmp_path / "cache.json").read_text())
+        assert cache["data"] is None
 
     @patch("claude_swap.update_check.subprocess.run")
     def test_fresh_cache_skips_uv(self, mock_run, tmp_path):
@@ -425,18 +477,84 @@ class TestHeldBackReleaseNotice(_UvInstall):
         assert notice is not None
         assert "claude-swap 0.28.0 is on PyPI" in notice
         assert 'uv-receipt.toml: exclude-newer-span = "P14D"' in notice
-        assert "uv tool install claude-swap --reinstall" in notice
+        assert "To upgrade now and drop the cooldown, run:" in notice
+        assert "uv tool install --reinstall claude-swap" in notice
+        assert "unset" not in notice
         assert "--exclude-newer" not in self._uv_command(mock_run)
 
     @patch("claude_swap.update_check.subprocess.run")
-    def test_env_var_is_named_as_the_source(self, mock_run, monkeypatch):
+    def test_reinstall_keeps_extras_and_with_packages(self, mock_run, tmp_path):
+        # A plain `uv tool install claude-swap --reinstall` would drop the
+        # [menubar] extra and every --with package with its dependencies.
+        self._write_receipt(
+            tmp_path,
+            'exclude-newer-span = "P14D"',
+            requirements=(
+                '{ name = "claude-swap", extras = ["menubar"] }, '
+                '{ name = "rich", specifier = ">=13" }, '
+                '{ name = "six", marker = "python_version < \'4\'" }, '
+                '{ name = "my-plugin", editable = "/home/wolph/my-plugin" }'
+            ),
+        )
+        mock_run.return_value = _uv_pip_list(_OUTDATED)
+
+        notice = held_back_release_notice("0.27.2")
+
+        assert notice is not None
+        assert (
+            'uv tool install --reinstall "claude-swap[menubar]" --with "rich>=13"'
+            ' --with "six; python_version < \'4\'" --with-editable /home/wolph/my-plugin'
+        ) in notice
+
+    @patch("claude_swap.update_check.subprocess.run")
+    def test_reinstall_drops_a_pin_on_the_tool_itself(self, mock_run, tmp_path):
+        # Reinstalling `claude-swap==0.27.2` would land on the release the
+        # user is trying to leave.
+        self._write_receipt(
+            tmp_path,
+            'exclude-newer-span = "P14D"',
+            requirements='{ name = "claude-swap", specifier = "==0.27.2" }',
+        )
+        mock_run.return_value = _uv_pip_list(_OUTDATED)
+
+        notice = held_back_release_notice("0.27.2")
+
+        assert notice is not None
+        assert "uv tool install --reinstall claude-swap\n" in notice + "\n"
+        assert "==0.27.2" not in notice
+
+    @patch("claude_swap.update_check.subprocess.run")
+    def test_editable_install_is_reinstalled_editable(self, mock_run, tmp_path):
+        self._write_receipt(
+            tmp_path,
+            'exclude-newer-span = "P14D"',
+            requirements='{ name = "claude-swap", editable = "/home/wolph/claude-swap" }',
+        )
+        mock_run.return_value = _uv_pip_list(_OUTDATED)
+
+        notice = held_back_release_notice("0.27.2")
+
+        assert notice is not None
+        assert "uv tool install --reinstall --editable /home/wolph/claude-swap" in notice
+
+    @patch("claude_swap.update_check.subprocess.run")
+    def test_env_var_is_named_as_the_source_and_unset_first(
+        self, mock_run, tmp_path, monkeypatch
+    ):
+        # Reinstalling with UV_EXCLUDE_NEWER still exported writes the
+        # cooldown straight back into the fresh receipt.
         monkeypatch.setenv("UV_EXCLUDE_NEWER", "1 week")
+        self._write_receipt(
+            tmp_path, requirements='{ name = "claude-swap", extras = ["menubar"] }'
+        )
         mock_run.return_value = _uv_pip_list(_OUTDATED)
 
         notice = held_back_release_notice("0.27.2")
 
         assert notice is not None
         assert "UV_EXCLUDE_NEWER=1 week" in notice
+        assert "unset UV_EXCLUDE_NEWER and run:" in notice
+        assert 'uv tool install --reinstall "claude-swap[menubar]"' in notice
 
     @patch("claude_swap.update_check.subprocess.run")
     def test_no_cooldown_means_no_notice_and_no_uv_call(self, mock_run):
@@ -474,7 +592,7 @@ class TestHeldBackReleaseNotice(_UvInstall):
 
         out = capsys.readouterr().out
         assert "claude-swap 0.28.0 is on PyPI" in out
-        assert "uv tool install claude-swap --reinstall" in out
+        assert "uv tool install --reinstall claude-swap" in out
         upgrade, listing = (c.args[0] for c in mock_run.call_args_list)
         assert upgrade == ["uv", "tool", "upgrade", "claude-swap"]
         assert listing[:4] == ["uv", "pip", "list", "--outdated"]
