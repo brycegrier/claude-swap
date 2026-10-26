@@ -15,7 +15,8 @@ from typing import Any, NamedTuple
 from claude_swap.cache import CACHE_DIR, MISSING, read_cache, write_cache
 
 CACHE_PATH = CACHE_DIR / "update_check.json"
-CACHE_TTL = 24 * 3600  # 24 hours
+CACHE_TTL = 24 * 3600  # A successful lookup is kept for a day.
+FAILURE_TTL = 3600  # A failed one is retried after an hour.
 PYPI_URL = "https://pypi.org/pypi/claude-swap/json"
 
 _VERSION_RE = re.compile(
@@ -133,68 +134,9 @@ def _uv_cooldown(receipt: dict[str, Any]) -> _Cooldown | None:
     return None
 
 
-_PLAIN_WORD_RE = re.compile(r"^[A-Za-z0-9._+=:/@-]+$")
-
-
-def _shell_word(word: str) -> str:
-    """Quote an argument for pasting into sh, cmd or PowerShell alike."""
-    return word if _PLAIN_WORD_RE.match(word) else f'"{word}"'
-
-
-def _requirement_spec(requirement: dict[str, Any], *, primary: bool) -> str | None:
-    """A receipt requirement as the user would spell it on the command line.
-
-    The primary requirement keeps only its extras: a version pin there would
-    reinstall the release the user is trying to move off.
-    """
-    name = requirement.get("name")
-    if not isinstance(name, str):
-        return None
-    extras = requirement.get("extras")
-    spec = name
-    if isinstance(extras, list) and extras:
-        spec += "[" + ",".join(str(extra) for extra in extras) + "]"
-    if primary:
-        return spec
-    specifier = requirement.get("specifier")
-    if isinstance(specifier, str):
-        spec += specifier
-    marker = requirement.get("marker")
-    if isinstance(marker, str):
-        spec += f"; {marker}"
-    return spec
-
-
-def _reinstall_command(receipt: dict[str, Any]) -> str:
-    """``uv tool install --reinstall`` with everything the receipt installed.
-
-    A plain ``uv tool install claude-swap --reinstall`` would drop the
-    ``[menubar]`` extra and every ``--with`` package along with their
-    dependencies, so the command is rebuilt from the receipt's requirement
-    list: the first entry is the tool itself and the rest were ``--with`` or
-    ``--with-editable``.
-    """
-    requirements = receipt.get("requirements")
-    if not isinstance(requirements, list):
-        requirements = []
-    args: list[str] = ["uv", "tool", "install", "--reinstall"]
-    primary_seen = False
-    for requirement in requirements:
-        if not isinstance(requirement, dict):
-            continue
-        editable = requirement.get("editable")
-        if isinstance(editable, str):
-            args += ["--editable" if not primary_seen else "--with-editable", editable]
-            primary_seen = True
-            continue
-        spec = _requirement_spec(requirement, primary=not primary_seen)
-        if spec is None:
-            continue
-        args += [spec] if not primary_seen else ["--with", spec]
-        primary_seen = True
-    if not primary_seen:
-        args.append("claude-swap")
-    return " ".join(_shell_word(arg) for arg in args)
+# A receipt value is pasted into a shell line unquoted, so only an ISO
+# duration ("P14D") or an RFC 3339 timestamp may pass.
+_CUTOFF_RE = re.compile(r"^[A-Za-z0-9.:+-]+$")
 
 
 def _uv_latest_version(current_version: str, cooldown: _Cooldown | None) -> str | None:
@@ -203,8 +145,9 @@ def _uv_latest_version(current_version: str, cooldown: _Cooldown | None) -> str 
     ``uv pip list --outdated`` resolves against the index the way ``uv tool
     upgrade`` does once it is handed the same exclude-newer setting, so the
     version it reports is one uv can actually install. Returns the current
-    version when nothing newer is visible and None when uv is missing or
-    fails. The environment variable is dropped so that the cooldown passed
+    version when nothing newer is visible and None when uv fails. A uv that
+    is not on PATH raises FileNotFoundError, since the caller treats that
+    differently from a failed resolve. The environment variable is dropped so that the cooldown passed
     here is the only one uv sees, and the command runs from the tool's own
     directory because uv reads the ``uv.toml`` or ``pyproject.toml`` of
     whatever project the shell happens to be in. ``uv tool upgrade`` does
@@ -225,6 +168,8 @@ def _uv_latest_version(current_version: str, cooldown: _Cooldown | None) -> str 
             cwd=sys.prefix,
         )
         rows = json.loads(result.stdout)
+    except FileNotFoundError:
+        raise
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
     for row in rows:
@@ -246,7 +191,7 @@ def _pypi_latest_version() -> str | None:
 
 
 class _Lookup(NamedTuple):
-    """A version lookup and whether its answer is worth keeping for a day."""
+    """A version lookup and whether its answer is worth writing to the cache."""
 
     latest: str | None
     cache: bool
@@ -255,21 +200,28 @@ class _Lookup(NamedTuple):
 def _latest_version(current_version: str, method: str | None) -> _Lookup:
     """The newest release the user's package manager will actually install.
 
-    uv is often off PATH when cswap runs under cron or launchd, and a failed
-    lookup cached for a day would keep the interactive runs that follow quiet
-    too. Without a cooldown PyPI answers the same question, so it takes over.
-    With one, PyPI would advertise releases the cooldown hides, so the run
-    stays quiet and leaves the cache alone for the next run to retry.
+    uv is often off PATH when cswap runs under cron or launchd. Without a
+    cooldown PyPI answers the same question, so it takes over. With one,
+    PyPI would advertise releases the cooldown hides, so the run stays quiet
+    and leaves the cache alone: the interactive run that follows has uv and
+    retries at once. Any other uv failure (a timeout, a failed resolve) is
+    cached like a PyPI failure, so a dead network costs one attempt per
+    FAILURE_TTL rather than one per command.
     """
     if method != "uv":
         return _Lookup(_pypi_latest_version(), cache=True)
     cooldown = _uv_cooldown(_read_receipt())
-    latest = _uv_latest_version(current_version, cooldown)
+    uv_missing = False
+    try:
+        latest = _uv_latest_version(current_version, cooldown)
+    except FileNotFoundError:
+        latest = None
+        uv_missing = True
     if latest is not None:
         return _Lookup(latest, cache=True)
     if cooldown is None:
         return _Lookup(_pypi_latest_version(), cache=True)
-    return _Lookup(None, cache=False)
+    return _Lookup(None, cache=not uv_missing)
 
 
 def held_back_release_notice(current_version: str) -> str | None:
@@ -278,31 +230,40 @@ def held_back_release_notice(current_version: str) -> str | None:
     uv prints "Nothing to upgrade" whether the install is current or the
     newest release is simply younger than the cooldown, and the user cannot
     tell the two apart. When a cooldown is set, this asks uv what it would
-    install without one and names the setting that is in the way. The remedy
-    is a reinstall that keeps the extras and ``--with`` packages, and when
-    the cooldown comes from ``UV_EXCLUDE_NEWER`` the variable has to go
-    first: uv writes it straight back into the fresh receipt otherwise.
+    install without one and names the setting that is in the way.
+
+    The remedy is ``uv tool upgrade`` itself with a zero cooldown, which
+    takes the release and leaves the receipt's extras, ``--with`` packages,
+    Python version and index options alone. uv stores the zero as
+    ``exclude-newer-span = "PT0S"``, so a second line restores the receipt's
+    own value. The flag also wins over ``UV_EXCLUDE_NEWER`` for that one
+    run, and since the variable keeps applying afterwards there is nothing
+    to restore in that case.
     """
-    receipt = _read_receipt()
-    cooldown = _uv_cooldown(receipt)
+    cooldown = _uv_cooldown(_read_receipt())
     if cooldown is None:
         return None
-    latest = _uv_latest_version(current_version, None)
     try:
+        latest = _uv_latest_version(current_version, None)
         if latest is None or not _is_newer(latest, current_version):
             return None
-    except ValueError:
+    except (FileNotFoundError, ValueError):
         return None
+    take_now = 'uv tool upgrade claude-swap --exclude-newer "0 days"'
+    lines = [
+        f"claude-swap {latest} is on PyPI, but this install has a release cooldown",
+        f"  ({cooldown.source}) that hides it from uv tool upgrade.",
+    ]
     if cooldown.from_env:
-        remedy = "To upgrade now and drop the cooldown, unset UV_EXCLUDE_NEWER and run:"
+        lines.append(f"  To take it now (the flag overrides UV_EXCLUDE_NEWER): {take_now}")
     else:
-        remedy = "To upgrade now and drop the cooldown, run:"
-    return (
-        f"claude-swap {latest} is on PyPI, but this install has a release cooldown\n"
-        f"  ({cooldown.source}) that hides it from uv tool upgrade.\n"
-        f"  {remedy}\n"
-        f"    {_reinstall_command(receipt)}"
-    )
+        lines.append(f"  To take it now:          {take_now}")
+        if _CUTOFF_RE.match(cooldown.value):
+            lines.append(
+                "  To restore the cooldown: "
+                f"uv tool upgrade claude-swap --exclude-newer {cooldown.value}"
+            )
+    return "\n".join(lines)
 
 
 def check_for_update(current_version: str) -> str | None:
@@ -310,13 +271,17 @@ def check_for_update(current_version: str) -> str | None:
     try:
         method = _detect_install_method()
         cached_data = read_cache(CACHE_PATH, CACHE_TTL)
+        if cached_data is None:
+            # A cached failure. Keep it for an hour, not a day.
+            cached_data = read_cache(CACHE_PATH, FAILURE_TTL)
         if cached_data is not MISSING and isinstance(cached_data, str | None):
             latest_version = cached_data
         else:
             lookup = _latest_version(current_version, method)
             latest_version = lookup.latest
-            # A failed PyPI lookup is cached too, so a dead network costs
-            # one timeout a day. A failed uv lookup under a cooldown is not.
+            # A failure is cached as None and expires after FAILURE_TTL.
+            # The one exception is uv missing under a cooldown, see
+            # _latest_version.
             if lookup.cache:
                 write_cache(CACHE_PATH, latest_version)
 
